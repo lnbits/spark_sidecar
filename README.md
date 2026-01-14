@@ -55,4 +55,6 @@ Each event payload is a JSON object:
 Optional tuning:
 
 - `SPARK_STREAM_KEEPALIVE_MS` (default `15000`)
+- `SPARK_STREAM_HEARTBEAT_MS` (default `30000`)
 - `SPARK_TRANSFER_LOOKUP_CONCURRENCY` (default `20`)
+- `SPARK_TRANSFER_QUEUE_MAX` (default `5000`)

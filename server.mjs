@@ -13,9 +13,17 @@ const STREAM_KEEPALIVE_MS = parseInt(
   process.env.SPARK_STREAM_KEEPALIVE_MS || '15000',
   10
 )
+const STREAM_HEARTBEAT_MS = parseInt(
+  process.env.SPARK_STREAM_HEARTBEAT_MS || '30000',
+  10
+)
 const TRANSFER_LOOKUP_CONCURRENCY = parseInt(
   process.env.SPARK_TRANSFER_LOOKUP_CONCURRENCY || '20',
   10
+)
+const TRANSFER_QUEUE_MAX = Math.max(
+  1,
+  parseInt(process.env.SPARK_TRANSFER_QUEUE_MAX || '5000', 10)
 )
 const ACCOUNT_NUMBER = process.env.SPARK_ACCOUNT_NUMBER
   ? parseInt(process.env.SPARK_ACCOUNT_NUMBER, 10)
@@ -31,10 +39,15 @@ let walletInstance
 const paymentHashToRequestId = new Map()
 const sseClients = new Set()
 const sseKeepaliveTimers = new Map()
+const sseHeartbeatTimers = new Map()
 const pendingTransferIds = new Set()
 const transferQueue = []
 let activeTransferLookups = 0
 let walletListenersAttached = false
+let droppedTransfers = 0
+let lastDropLog = 0
+
+const DROP_LOG_INTERVAL_MS = 10000
 
 function attachWalletListeners(wallet) {
   if (walletListenersAttached) {
@@ -164,6 +177,20 @@ function enqueueTransferLookup(transferId) {
     return
   }
   pendingTransferIds.add(transferId)
+  if (transferQueue.length >= TRANSFER_QUEUE_MAX) {
+    const dropped = transferQueue.shift()
+    if (dropped) {
+      pendingTransferIds.delete(dropped)
+      droppedTransfers += 1
+      const now = Date.now()
+      if (now - lastDropLog > DROP_LOG_INTERVAL_MS) {
+        console.warn(
+          `Dropping transfer events due to queue pressure: ${droppedTransfers}`
+        )
+        lastDropLog = now
+      }
+    }
+  }
   transferQueue.push(transferId)
   processTransferQueue()
 }
@@ -237,6 +264,19 @@ function addSseClient(res) {
     sseKeepaliveTimers.set(res, timer)
   }
 
+  if (STREAM_HEARTBEAT_MS > 0) {
+    const timer = setInterval(() => {
+      try {
+        res.write(
+          `data: ${JSON.stringify({type: 'heartbeat', ts: Date.now()})}\n\n`
+        )
+      } catch (error) {
+        removeSseClient(res)
+      }
+    }, STREAM_HEARTBEAT_MS)
+    sseHeartbeatTimers.set(res, timer)
+  }
+
   res.on('close', () => {
     removeSseClient(res)
   })
@@ -252,6 +292,11 @@ function removeSseClient(res) {
     clearInterval(timer)
   }
   sseKeepaliveTimers.delete(res)
+  const heartbeatTimer = sseHeartbeatTimers.get(res)
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer)
+  }
+  sseHeartbeatTimers.delete(res)
 }
 
 const server = http.createServer(async (req, res) => {
