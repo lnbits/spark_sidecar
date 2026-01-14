@@ -17,6 +17,18 @@ const STREAM_HEARTBEAT_MS = parseInt(
   process.env.SPARK_STREAM_HEARTBEAT_MS || '30000',
   10
 )
+const INVOICE_POLL_MS = parseInt(
+  process.env.SPARK_INVOICE_POLL_MS || '2000',
+  10
+)
+const INVOICE_POLL_LIMIT = parseInt(
+  process.env.SPARK_INVOICE_POLL_LIMIT || '100',
+  10
+)
+const INVOICE_CACHE_TTL_MS = parseInt(
+  process.env.SPARK_INVOICE_CACHE_TTL_MS || '3600000',
+  10
+)
 const TRANSFER_LOOKUP_CONCURRENCY = parseInt(
   process.env.SPARK_TRANSFER_LOOKUP_CONCURRENCY || '20',
   10
@@ -46,6 +58,9 @@ let activeTransferLookups = 0
 let walletListenersAttached = false
 let droppedTransfers = 0
 let lastDropLog = 0
+const emittedInvoiceIds = new Map()
+let invoicePollTimer = null
+let invoicePollInFlight = false
 
 const DROP_LOG_INTERVAL_MS = 10000
 
@@ -210,6 +225,75 @@ function processTransferQueue() {
   }
 }
 
+function pruneEmittedInvoiceCache(now) {
+  if (INVOICE_CACHE_TTL_MS <= 0) {
+    return
+  }
+  for (const [invoiceId, timestamp] of emittedInvoiceIds) {
+    if (now - timestamp > INVOICE_CACHE_TTL_MS) {
+      emittedInvoiceIds.delete(invoiceId)
+    }
+  }
+}
+
+async function pollInvoiceUpdates() {
+  if (invoicePollInFlight || sseClients.size === 0) {
+    return
+  }
+  invoicePollInFlight = true
+  try {
+    const wallet = walletInstance || (await getWallet())
+    const response = await wallet.getUserRequests({
+      first: INVOICE_POLL_LIMIT,
+      types: ['LIGHTNING_RECEIVE'],
+      statuses: ['SUCCEEDED']
+    })
+    const now = Date.now()
+    pruneEmittedInvoiceCache(now)
+    const entities = response?.entities || []
+    for (const request of entities) {
+      if (!request || request.typename !== 'LightningReceiveRequest') {
+        continue
+      }
+      if (!RECEIVE_SUCCESS_STATUSES.has(request.status)) {
+        continue
+      }
+      if (emittedInvoiceIds.has(request.id)) {
+        continue
+      }
+      emittedInvoiceIds.set(request.id, now)
+      const invoice = request.invoice || {}
+      sendSseEvent({
+        checking_id: request.id,
+        payment_hash: invoice.paymentHash || null,
+        status: request.status
+      })
+    }
+  } catch (error) {
+    console.error('Error polling lightning invoices:', error)
+  } finally {
+    invoicePollInFlight = false
+  }
+}
+
+function startInvoicePolling() {
+  if (INVOICE_POLL_MS <= 0 || invoicePollTimer) {
+    return
+  }
+  invoicePollTimer = setInterval(() => {
+    void pollInvoiceUpdates()
+  }, INVOICE_POLL_MS)
+  void pollInvoiceUpdates()
+}
+
+function stopInvoicePolling() {
+  if (!invoicePollTimer) {
+    return
+  }
+  clearInterval(invoicePollTimer)
+  invoicePollTimer = null
+}
+
 async function handleTransferLookup(transferId) {
   try {
     const wallet = walletInstance || (await getWallet())
@@ -280,6 +364,8 @@ function addSseClient(res) {
   res.on('close', () => {
     removeSseClient(res)
   })
+
+  startInvoicePolling()
 }
 
 function removeSseClient(res) {
@@ -297,6 +383,10 @@ function removeSseClient(res) {
     clearInterval(heartbeatTimer)
   }
   sseHeartbeatTimers.delete(res)
+
+  if (sseClients.size === 0) {
+    stopInvoicePolling()
+  }
 }
 
 const server = http.createServer(async (req, res) => {
