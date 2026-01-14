@@ -1,6 +1,6 @@
 import http from 'node:http'
 
-import {SparkWallet} from '@buildonspark/spark-sdk'
+import {SparkWallet, SparkWalletEvent} from '@buildonspark/spark-sdk'
 
 const PORT = parseInt(process.env.SPARK_SIDECAR_PORT || '8765', 10)
 const HOST = process.env.SPARK_SIDECAR_HOST || '127.0.0.1'
@@ -9,6 +9,14 @@ const MNEMONIC = process.env.SPARK_MNEMONIC || ''
 const NETWORK = process.env.SPARK_NETWORK || 'MAINNET'
 const PAY_WAIT_MS = parseInt(process.env.SPARK_PAY_WAIT_MS || '4000', 10)
 const PAY_POLL_MS = parseInt(process.env.SPARK_PAY_POLL_MS || '500', 10)
+const STREAM_KEEPALIVE_MS = parseInt(
+  process.env.SPARK_STREAM_KEEPALIVE_MS || '15000',
+  10
+)
+const TRANSFER_LOOKUP_CONCURRENCY = parseInt(
+  process.env.SPARK_TRANSFER_LOOKUP_CONCURRENCY || '20',
+  10
+)
 const ACCOUNT_NUMBER = process.env.SPARK_ACCOUNT_NUMBER
   ? parseInt(process.env.SPARK_ACCOUNT_NUMBER, 10)
   : undefined
@@ -19,16 +27,46 @@ if (!MNEMONIC) {
 }
 
 let walletPromise
+let walletInstance
 const paymentHashToRequestId = new Map()
+const sseClients = new Set()
+const sseKeepaliveTimers = new Map()
+const pendingTransferIds = new Set()
+const transferQueue = []
+let activeTransferLookups = 0
+let walletListenersAttached = false
+
+function attachWalletListeners(wallet) {
+  if (walletListenersAttached) {
+    return
+  }
+  walletListenersAttached = true
+
+  wallet.on(SparkWalletEvent.TransferClaimed, transferId => {
+    if (!transferId) {
+      return
+    }
+    enqueueTransferLookup(transferId)
+  })
+}
+
 async function getWallet() {
   if (!walletPromise) {
     walletPromise = SparkWallet.initialize({
       mnemonicOrSeed: MNEMONIC,
       accountNumber: ACCOUNT_NUMBER,
       options: {network: NETWORK}
-    }).then(({wallet}) => wallet)
+    }).then(({wallet}) => {
+      walletInstance = wallet
+      attachWalletListeners(wallet)
+      return wallet
+    })
   }
-  return walletPromise
+  const wallet = await walletPromise
+  if (wallet && !walletListenersAttached) {
+    attachWalletListeners(wallet)
+  }
+  return wallet
 }
 
 async function shutdown() {
@@ -99,6 +137,11 @@ const SEND_FAILURE_STATUSES = new Set([
   'USER_TRANSFER_VALIDATION_FAILED',
   'USER_SWAP_RETURN_FAILED'
 ])
+const RECEIVE_SUCCESS_STATUSES = new Set([
+  'LIGHTNING_PAYMENT_RECEIVED',
+  'TRANSFER_COMPLETED',
+  'PAYMENT_PREIMAGE_RECOVERED'
+])
 
 function isSendTerminal(status) {
   return SEND_SUCCESS_STATUSES.has(status) || SEND_FAILURE_STATUSES.has(status)
@@ -116,6 +159,101 @@ async function waitForSendStatus(wallet, requestId, timeoutMs) {
   return null
 }
 
+function enqueueTransferLookup(transferId) {
+  if (pendingTransferIds.has(transferId)) {
+    return
+  }
+  pendingTransferIds.add(transferId)
+  transferQueue.push(transferId)
+  processTransferQueue()
+}
+
+function processTransferQueue() {
+  while (
+    activeTransferLookups < TRANSFER_LOOKUP_CONCURRENCY &&
+    transferQueue.length > 0
+  ) {
+    const transferId = transferQueue.shift()
+    activeTransferLookups += 1
+    void handleTransferLookup(transferId).finally(() => {
+      activeTransferLookups -= 1
+      pendingTransferIds.delete(transferId)
+      processTransferQueue()
+    })
+  }
+}
+
+async function handleTransferLookup(transferId) {
+  try {
+    const wallet = walletInstance || (await getWallet())
+    const transfer = await wallet.getTransferFromSsp(transferId)
+    const userRequest = transfer?.userRequest
+    if (!userRequest || userRequest.typename !== 'LightningReceiveRequest') {
+      return
+    }
+    if (!RECEIVE_SUCCESS_STATUSES.has(userRequest.status)) {
+      return
+    }
+    const invoice = userRequest.invoice || {}
+    sendSseEvent({
+      checking_id: userRequest.id,
+      payment_hash: invoice.paymentHash || null,
+      status: userRequest.status
+    })
+  } catch (error) {
+    console.error('Error handling transfer event:', error)
+  }
+}
+
+function sendSseEvent(payload) {
+  const data = `data: ${JSON.stringify(payload)}\n\n`
+  for (const res of sseClients) {
+    try {
+      res.write(data)
+    } catch (error) {
+      removeSseClient(res)
+    }
+  }
+}
+
+function addSseClient(res) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+    'x-accel-buffering': 'no'
+  })
+  res.write(':\n\n')
+  sseClients.add(res)
+
+  if (STREAM_KEEPALIVE_MS > 0) {
+    const timer = setInterval(() => {
+      try {
+        res.write(':\n\n')
+      } catch (error) {
+        removeSseClient(res)
+      }
+    }, STREAM_KEEPALIVE_MS)
+    sseKeepaliveTimers.set(res, timer)
+  }
+
+  res.on('close', () => {
+    removeSseClient(res)
+  })
+}
+
+function removeSseClient(res) {
+  if (!sseClients.has(res)) {
+    return
+  }
+  sseClients.delete(res)
+  const timer = sseKeepaliveTimers.get(res)
+  if (timer) {
+    clearInterval(timer)
+  }
+  sseKeepaliveTimers.delete(res)
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(
     req.url || '/',
@@ -129,6 +267,12 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && url.pathname === '/health') {
       return sendJson(res, 200, {status: 'ok'})
+    }
+
+    if (req.method === 'GET' && url.pathname === '/v1/invoices/stream') {
+      await getWallet()
+      addSseClient(res)
+      return
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/balance') {
