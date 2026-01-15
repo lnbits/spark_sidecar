@@ -64,6 +64,17 @@ let invoicePollInFlight = false
 
 const DROP_LOG_INTERVAL_MS = 10000
 
+function rememberInvoiceEmitted(requestId, now = Date.now()) {
+  if (!requestId) {
+    return false
+  }
+  if (emittedInvoiceIds.has(requestId)) {
+    return true
+  }
+  emittedInvoiceIds.set(requestId, now)
+  return false
+}
+
 function attachWalletListeners(wallet) {
   if (walletListenersAttached) {
     return
@@ -258,10 +269,9 @@ async function pollInvoiceUpdates() {
       if (!RECEIVE_SUCCESS_STATUSES.has(request.status)) {
         continue
       }
-      if (emittedInvoiceIds.has(request.id)) {
+      if (rememberInvoiceEmitted(request.id, now)) {
         continue
       }
-      emittedInvoiceIds.set(request.id, now)
       const invoice = request.invoice || {}
       sendSseEvent({
         checking_id: request.id,
@@ -303,6 +313,9 @@ async function handleTransferLookup(transferId) {
       return
     }
     if (!RECEIVE_SUCCESS_STATUSES.has(userRequest.status)) {
+      return
+    }
+    if (rememberInvoiceEmitted(userRequest.id)) {
       return
     }
     const invoice = userRequest.invoice || {}
