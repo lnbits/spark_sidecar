@@ -1,4 +1,6 @@
+import fs from 'node:fs'
 import http from 'node:http'
+import path from 'node:path'
 
 import {SparkWallet, SparkWalletEvent} from '@buildonspark/spark-sdk'
 
@@ -40,6 +42,13 @@ const TRANSFER_QUEUE_MAX = Math.max(
 const ACCOUNT_NUMBER = process.env.SPARK_ACCOUNT_NUMBER
   ? parseInt(process.env.SPARK_ACCOUNT_NUMBER, 10)
   : undefined
+const STATE_PATH =
+  process.env.SPARK_SIDECAR_STATE_PATH ||
+  path.join(process.cwd(), 'spark-sidecar-state.json')
+const STATE_PERSIST_DEBOUNCE_MS = parseInt(
+  process.env.SPARK_STATE_PERSIST_DEBOUNCE_MS || '1000',
+  10
+)
 
 if (!MNEMONIC) {
   console.error('Missing SPARK_MNEMONIC for Spark sidecar.')
@@ -61,8 +70,61 @@ let lastDropLog = 0
 const emittedInvoiceIds = new Map()
 let invoicePollTimer = null
 let invoicePollInFlight = false
+let lastSeenUpdatedAtMs = 0
+let statePersistTimer = null
+let baselineInitialized = false
+let stateLoaded = false
 
 const DROP_LOG_INTERVAL_MS = 10000
+
+loadState()
+
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_PATH)) {
+      return
+    }
+    const raw = fs.readFileSync(STATE_PATH, 'utf8')
+    const parsed = JSON.parse(raw)
+    stateLoaded = true
+    if (Number.isFinite(parsed?.lastSeenUpdatedAtMs)) {
+      lastSeenUpdatedAtMs = parsed.lastSeenUpdatedAtMs
+    }
+  } catch (error) {
+    console.error('Error loading Spark sidecar state:', error)
+  }
+}
+
+async function persistState() {
+  try {
+    await fs.promises.writeFile(
+      STATE_PATH,
+      JSON.stringify({lastSeenUpdatedAtMs}),
+      'utf8'
+    )
+  } catch (error) {
+    console.error('Error persisting Spark sidecar state:', error)
+  }
+}
+
+function scheduleStatePersist() {
+  if (statePersistTimer) {
+    return
+  }
+  statePersistTimer = setTimeout(() => {
+    statePersistTimer = null
+    void persistState()
+  }, Math.max(0, STATE_PERSIST_DEBOUNCE_MS))
+}
+
+function getRequestUpdatedAtMs(request) {
+  const stamp = request?.updatedAt || request?.createdAt
+  if (!stamp) {
+    return 0
+  }
+  const parsed = Date.parse(stamp)
+  return Number.isFinite(parsed) ? parsed : 0
+}
 
 function rememberInvoiceEmitted(requestId, now = Date.now()) {
   if (!requestId) {
@@ -253,31 +315,77 @@ async function pollInvoiceUpdates() {
   }
   invoicePollInFlight = true
   try {
-    const wallet = walletInstance || (await getWallet())
-    const response = await wallet.getUserRequests({
-      first: INVOICE_POLL_LIMIT,
-      types: ['LIGHTNING_RECEIVE'],
-      statuses: ['SUCCEEDED']
-    })
     const now = Date.now()
     pruneEmittedInvoiceCache(now)
-    const entities = response?.entities || []
-    for (const request of entities) {
-      if (!request || request.typename !== 'LightningReceiveRequest') {
-        continue
-      }
-      if (!RECEIVE_SUCCESS_STATUSES.has(request.status)) {
-        continue
-      }
-      if (rememberInvoiceEmitted(request.id, now)) {
-        continue
-      }
-      const invoice = request.invoice || {}
-      sendSseEvent({
-        checking_id: request.id,
-        payment_hash: invoice.paymentHash || null,
-        status: request.status
+    const wallet = walletInstance || (await getWallet())
+    let maxSeenUpdatedAtMs = lastSeenUpdatedAtMs
+    let hasEntity = false
+    let cursor = undefined
+    let reachedKnown = false
+    let isFirstPage = true
+    while (true) {
+      const response = await wallet.getUserRequests({
+        first: INVOICE_POLL_LIMIT,
+        after: cursor,
+        types: ['LIGHTNING_RECEIVE'],
+        statuses: ['SUCCEEDED']
       })
+      const entities = response?.entities || []
+      for (const request of entities) {
+        if (!request || request.typename !== 'LightningReceiveRequest') {
+          continue
+        }
+        if (!RECEIVE_SUCCESS_STATUSES.has(request.status)) {
+          continue
+        }
+        const updatedAtMs = getRequestUpdatedAtMs(request)
+        hasEntity = true
+        if (updatedAtMs > maxSeenUpdatedAtMs) {
+          maxSeenUpdatedAtMs = updatedAtMs
+        }
+        if (!baselineInitialized && !stateLoaded && lastSeenUpdatedAtMs === 0) {
+          continue
+        }
+        if (updatedAtMs && updatedAtMs <= lastSeenUpdatedAtMs) {
+          reachedKnown = true
+          continue
+        }
+        if (rememberInvoiceEmitted(request.id, now)) {
+          continue
+        }
+        const invoice = request.invoice || {}
+        sendSseEvent({
+          checking_id: request.id,
+          payment_hash: invoice.paymentHash || null,
+          status: request.status
+        })
+      }
+
+      if (
+        isFirstPage &&
+        !baselineInitialized &&
+        !stateLoaded &&
+        lastSeenUpdatedAtMs === 0
+      ) {
+        baselineInitialized = true
+        if (hasEntity && maxSeenUpdatedAtMs > lastSeenUpdatedAtMs) {
+          lastSeenUpdatedAtMs = maxSeenUpdatedAtMs
+          scheduleStatePersist()
+        }
+        return
+      }
+
+      const pageInfo = response?.pageInfo || {}
+      cursor = pageInfo.endCursor
+      if (!pageInfo.hasNextPage || !cursor || reachedKnown) {
+        break
+      }
+      isFirstPage = false
+    }
+
+    if (maxSeenUpdatedAtMs > lastSeenUpdatedAtMs) {
+      lastSeenUpdatedAtMs = maxSeenUpdatedAtMs
+      scheduleStatePersist()
     }
   } catch (error) {
     console.error('Error polling lightning invoices:', error)
@@ -315,6 +423,10 @@ async function handleTransferLookup(transferId) {
     if (!RECEIVE_SUCCESS_STATUSES.has(userRequest.status)) {
       return
     }
+    const updatedAtMs = getRequestUpdatedAtMs(userRequest)
+    if (updatedAtMs && updatedAtMs <= lastSeenUpdatedAtMs) {
+      return
+    }
     if (rememberInvoiceEmitted(userRequest.id)) {
       return
     }
@@ -324,6 +436,10 @@ async function handleTransferLookup(transferId) {
       payment_hash: invoice.paymentHash || null,
       status: userRequest.status
     })
+    if (updatedAtMs > lastSeenUpdatedAtMs) {
+      lastSeenUpdatedAtMs = updatedAtMs
+      scheduleStatePersist()
+    }
   } catch (error) {
     console.error('Error handling transfer event:', error)
   }
