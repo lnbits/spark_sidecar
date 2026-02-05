@@ -27,6 +27,29 @@ SPARK_SIDECAR_API_KEY="mykey"
 
 Set the same key in LNbits as `SPARK_L2_API_KEY`.
 
+## Nix (flake)
+
+Build:
+
+```
+nix build
+```
+
+Run:
+
+```
+SPARK_MNEMONIC="bottom bottom bottom bottom bottom bottom bottom bottom bottom bottom bottom bottom" \
+SPARK_NETWORK=MAINNET \
+SPARK_SIDECAR_PORT=8765 \
+SPARK_PAY_WAIT_MS=20000 \
+nix run
+```
+
+Notes:
+
+- The flake includes `flake.nix` and `flake.lock`. Commit both.
+- The `result` symlink from `nix build` should not be committed.
+
 ## Endpoints
 
 - `POST /v1/balance`
