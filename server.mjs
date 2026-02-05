@@ -583,6 +583,7 @@ const server = http.createServer(async (req, res) => {
         ? Number(body.amount_sats)
         : undefined
       const paymentHash = body.payment_hash || null
+      try {
       let payment = await wallet.payLightningInvoice({
         invoice: bolt11,
         maxFeeSats,
@@ -612,6 +613,18 @@ const server = http.createServer(async (req, res) => {
         fee_msat: feeToMsat(payment.fee),
         preimage: payment.paymentPreimage || null
       })
+      } catch (error) {
+        console.error('Error processing payment:', error)
+        const message =
+          error && typeof error === 'object' && 'initialMessage' in error
+            ? error.initialMessage
+            : error instanceof Error
+            ? error.message
+            : String(error)
+        message == '' && (message = 'Payment failed')
+
+        return sendJson(res, 500, {error: message})
+      }
     }
 
     const parts = url.pathname.split('/').filter(Boolean)
