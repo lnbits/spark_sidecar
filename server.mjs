@@ -156,6 +156,7 @@ function attachWalletListeners(wallet) {
 
 async function getWallet() {
   if (!walletPromise) {
+    console.log('Initializing Spark wallet...')
     walletPromise = SparkWallet.initialize({
       mnemonicOrSeed: MNEMONIC,
       accountNumber: ACCOUNT_NUMBER,
@@ -170,11 +171,13 @@ async function getWallet() {
   if (wallet && !walletListenersAttached) {
     attachWalletListeners(wallet)
   }
+  console.log('Spark wallet initialized.')
   return wallet
 }
 
 async function shutdown() {
   try {
+    console.log('Shutting down Spark sidecar...')
     if (walletPromise) {
       const wallet = await walletPromise
       if (wallet && typeof wallet.cleanupConnections === 'function') {
@@ -334,6 +337,9 @@ async function pollInvoiceUpdates() {
         statuses: ['SUCCEEDED']
       })
       const entities = response?.entities || []
+      console.log(
+        `Polled ${entities.length} lightning receive requests (cursor: ${cursor})`
+      )
       for (const request of entities) {
         if (!request || request.typename !== 'LightningReceiveRequest') {
           continue
@@ -449,6 +455,7 @@ async function handleTransferLookup(transferId) {
 }
 
 function sendSseEvent(payload) {
+  console.log('Emitting SSE event:')
   const data = `data: ${JSON.stringify(payload)}\n\n`
   for (const res of sseClients) {
     try {
@@ -528,9 +535,11 @@ const server = http.createServer(async (req, res) => {
   )
 
   if (API_KEY && req.headers['x-api-key'] !== API_KEY) {
+    console.log('Unauthorized request with invalid API key')
     return sendJson(res, 401, {error: 'Unauthorized'})
   }
 
+  console.log(`${req.method} ${url.pathname}`)
   try {
     if (req.method === 'GET' && url.pathname === '/health') {
       return sendJson(res, 200, {status: 'ok'})
@@ -663,6 +672,7 @@ const server = http.createServer(async (req, res) => {
 
     return sendJson(res, 404, {error: 'Not found'})
   } catch (error) {
+    console.error('Error handling request:', error)
     const message = error instanceof Error ? error.message : String(error)
     return sendJson(res, 500, {error: message})
   }
