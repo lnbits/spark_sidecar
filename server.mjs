@@ -584,35 +584,35 @@ const server = http.createServer(async (req, res) => {
         : undefined
       const paymentHash = body.payment_hash || null
       try {
-      let payment = await wallet.payLightningInvoice({
-        invoice: bolt11,
-        maxFeeSats,
-        amountSatsToSend
-      })
-      if (
-        PAY_WAIT_MS > 0 &&
-        payment &&
-        payment.id &&
-        !isSendTerminal(payment.status)
-      ) {
-        const refreshed = await waitForSendStatus(
-          wallet,
-          payment.id,
-          PAY_WAIT_MS
-        )
-        if (refreshed) {
-          payment = refreshed
+        let payment = await wallet.payLightningInvoice({
+          invoice: bolt11,
+          maxFeeSats,
+          amountSatsToSend
+        })
+        if (
+          PAY_WAIT_MS > 0 &&
+          payment &&
+          payment.id &&
+          !isSendTerminal(payment.status)
+        ) {
+          const refreshed = await waitForSendStatus(
+            wallet,
+            payment.id,
+            PAY_WAIT_MS
+          )
+          if (refreshed) {
+            payment = refreshed
+          }
         }
-      }
-      if (paymentHash && payment?.id) {
-        paymentHashToRequestId.set(paymentHash, payment.id)
-      }
-      return sendJson(res, 200, {
-        checking_id: paymentHash || payment.id,
-        status: payment.status,
-        fee_msat: feeToMsat(payment.fee),
-        preimage: payment.paymentPreimage || null
-      })
+        if (paymentHash && payment?.id) {
+          paymentHashToRequestId.set(paymentHash, payment.id)
+        }
+        return sendJson(res, 200, {
+          checking_id: paymentHash || payment.id,
+          status: payment.status,
+          fee_msat: feeToMsat(payment.fee),
+          preimage: payment.paymentPreimage || null
+        })
       } catch (error) {
         console.error('Error processing payment:', error)
         const message =
