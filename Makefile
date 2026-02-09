@@ -16,6 +16,3 @@ pyright:
 
 checkprettier:
 	uv run ./node_modules/.bin/prettier --check .
-
-sass:
-	npm run sass

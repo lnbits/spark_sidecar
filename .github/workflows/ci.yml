@@ -8,4 +8,3 @@ on:
 jobs:
   lint:
     uses: lnbits/lnbits/.github/workflows/lint.yml@dev
- 
