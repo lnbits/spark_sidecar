@@ -29,3 +29,6 @@ checkbundle:
 
 mypy:
 	echo "Does not apply, skipping."
+
+poetry:
+	echo "Does not apply, skipping."
