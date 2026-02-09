@@ -26,3 +26,6 @@ checkruff:
 
 checkbundle:
 	echo "Does not apply, skipping."
+
+mypy:
+	echo "Does not apply, skipping."
