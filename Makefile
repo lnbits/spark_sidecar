@@ -16,3 +16,13 @@ pyright:
 
 checkprettier:
 	uv run ./node_modules/.bin/prettier --check .
+
+
+checkblack:
+	echo "Does not apply, skipping."
+
+checkruff:
+	echo "Does not apply, skipping."
+
+checkbundle:
+	echo "Does not apply, skipping."
