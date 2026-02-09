@@ -455,7 +455,7 @@ async function handleTransferLookup(transferId) {
 }
 
 function sendSseEvent(payload) {
-  console.log('Emitting SSE event:')
+  console.log('Sending SSE event')
   const data = `data: ${JSON.stringify(payload)}\n\n`
   for (const res of sseClients) {
     try {
