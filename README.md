@@ -72,7 +72,11 @@ curl -N http://127.0.0.1:8765/v1/invoices/stream
 Each event payload is a JSON object:
 
 ```json
-{"checking_id":"<receive_request_id>","payment_hash":"<hash>","status":"LIGHTNING_PAYMENT_RECEIVED"}
+{
+  "checking_id": "<receive_request_id>",
+  "payment_hash": "<hash>",
+  "status": "LIGHTNING_PAYMENT_RECEIVED"
+}
 ```
 
 Optional tuning:

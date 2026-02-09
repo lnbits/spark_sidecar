@@ -111,10 +111,13 @@ function scheduleStatePersist() {
   if (statePersistTimer) {
     return
   }
-  statePersistTimer = setTimeout(() => {
-    statePersistTimer = null
-    void persistState()
-  }, Math.max(0, STATE_PERSIST_DEBOUNCE_MS))
+  statePersistTimer = setTimeout(
+    () => {
+      statePersistTimer = null
+      void persistState()
+    },
+    Math.max(0, STATE_PERSIST_DEBOUNCE_MS)
+  )
 }
 
 function getRequestUpdatedAtMs(request) {
@@ -619,8 +622,8 @@ const server = http.createServer(async (req, res) => {
           error && typeof error === 'object' && 'initialMessage' in error
             ? error.initialMessage
             : error instanceof Error
-            ? error.message
-            : String(error)
+              ? error.message
+              : String(error)
         message == '' && (message = 'Payment failed')
 
         return sendJson(res, 500, {error: message})
