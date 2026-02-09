@@ -7,3 +7,5 @@ authors = [{ name = "Alan Bits", email = "alan@lnbits.com" }]
 urls = { Homepage = "https://lnbits.com", Repository = "https://github.com/lnbits/spark_sidecar" }
 dependencies = [ "lnbits>1" ]
 
+[tool.poetry]
+package-mode = false
