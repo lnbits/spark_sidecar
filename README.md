@@ -1,6 +1,7 @@
 # Spark L2 sidecar
 
 This sidecar exposes a small HTTP API for LNbits to talk to the Spark L2 SDK.
+https://www.spark.money/
 
 ## Install
 
