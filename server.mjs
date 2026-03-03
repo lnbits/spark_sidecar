@@ -7,7 +7,7 @@ import {SparkWallet, SparkWalletEvent} from '@buildonspark/spark-sdk'
 const PORT = parseInt(process.env.SPARK_SIDECAR_PORT || '8765', 10)
 const HOST = process.env.SPARK_SIDECAR_HOST || '127.0.0.1'
 const API_KEY = process.env.SPARK_SIDECAR_API_KEY || ''
-const MNEMONIC = process.env.SPARK_MNEMONIC || ''
+let mnemonic = process.env.SPARK_MNEMONIC || ''
 const NETWORK = process.env.SPARK_NETWORK || 'MAINNET'
 const PAY_WAIT_MS = parseInt(process.env.SPARK_PAY_WAIT_MS || '4000', 10)
 const PAY_POLL_MS = parseInt(process.env.SPARK_PAY_POLL_MS || '500', 10)
@@ -50,9 +50,12 @@ const STATE_PERSIST_DEBOUNCE_MS = parseInt(
   10
 )
 
-if (!MNEMONIC) {
-  console.error('Missing SPARK_MNEMONIC for Spark sidecar.')
-  process.exit(1)
+let mnemonicReadyResolve
+const mnemonicReady = new Promise(resolve => {
+  mnemonicReadyResolve = resolve
+})
+if (mnemonic) {
+  mnemonicReadyResolve()
 }
 
 let walletPromise
@@ -155,10 +158,11 @@ function attachWalletListeners(wallet) {
 }
 
 async function getWallet() {
+  await mnemonicReady
   if (!walletPromise) {
     console.log('Initializing Spark wallet...')
     walletPromise = SparkWallet.initialize({
-      mnemonicOrSeed: MNEMONIC,
+      mnemonicOrSeed: mnemonic,
       accountNumber: ACCOUNT_NUMBER,
       options: {network: NETWORK}
     }).then(({wallet}) => {
@@ -230,6 +234,21 @@ function feeToMsat(fee) {
     default:
       return BigInt(Math.round(value * 1000)).toString()
   }
+}
+
+function setMnemonic(nextMnemonic) {
+  if (!nextMnemonic) {
+    return {status: 'missing'}
+  }
+  if (mnemonic) {
+    if (mnemonic === nextMnemonic) {
+      return {status: 'already_set'}
+    }
+    return {status: 'conflict'}
+  }
+  mnemonic = nextMnemonic
+  mnemonicReadyResolve()
+  return {status: 'set'}
 }
 
 const SEND_SUCCESS_STATUSES = new Set([
@@ -543,6 +562,19 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && url.pathname === '/health') {
       return sendJson(res, 200, {status: 'ok'})
+    }
+
+    if (req.method === 'POST' && url.pathname === '/v1/mnemonic') {
+      const body = await readJson(req)
+      const provided = body.mnemonic || body.mnemonic_or_seed || ''
+      const result = setMnemonic(provided)
+      if (result.status === 'missing') {
+        return sendJson(res, 400, {error: 'Missing mnemonic'})
+      }
+      if (result.status === 'conflict') {
+        return sendJson(res, 409, {error: 'Mnemonic already set'})
+      }
+      return sendJson(res, 200, {status: result.status})
     }
 
     if (req.method === 'GET' && url.pathname === '/v1/invoices/stream') {
