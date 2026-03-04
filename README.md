@@ -27,6 +27,7 @@ SPARK_MNEMONIC="bottom bottom bottom bottom bottom bottom bottom bottom bottom b
 SPARK_NETWORK=MAINNET \
 SPARK_SIDECAR_PORT=8765 \
 SPARK_PAY_WAIT_MS=20000 \
+chmod +x server.mjs \
 node server.mjs
 ```
 
@@ -37,6 +38,15 @@ SPARK_SIDECAR_API_KEY="mykey"
 ```
 
 Set the same key in LNbits as `SPARK_L2_API_KEY`.
+
+If you prefer to provide the mnemonic after startup, omit `SPARK_MNEMONIC` and
+POST it to the sidecar:
+
+```bash
+curl -X POST http://127.0.0.1:8765/v1/mnemonic \
+  -H "Content-Type: application/json" \
+  -d '{"mnemonic":"bottom bottom bottom bottom bottom bottom bottom bottom bottom bottom bottom bottom"}'
+```
 
 ## Nix (flake)
 
@@ -63,6 +73,7 @@ Notes:
 
 ## Endpoints
 
+- `POST /v1/mnemonic`
 - `POST /v1/balance`
 - `POST /v1/invoices`
 - `POST /v1/payments`

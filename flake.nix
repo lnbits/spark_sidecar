@@ -16,9 +16,10 @@
         package = pkgs.buildNpmPackage {
           inherit pname version;
           src = ./.;
-          npmDepsHash = "sha256-IF87onWOqsv3vtrGWpP95zaaUpRtKiDJ5NokNWDAzEQ=";
+          npmDepsHash = "sha256-DsxMBn3ZiAnTEsv97e6f4NLi+Mw5VDi4aQKIA4k80nQ=";
 
           dontNpmBuild = true;
+          dontBuild = true;
 
           installPhase = ''
             runHook preInstall
