@@ -584,12 +584,16 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/balance') {
+      if (!mnemonic) {
+        return sendJson(res, 200, {status: 'missing_mnemonic'})
+      }
       const wallet = await getWallet()
       const balance = await wallet.getBalance()
       const sats = BigInt(balance.balance)
       return sendJson(res, 200, {
         balance_sats: sats.toString(),
-        balance_msat: (sats * 1000n).toString()
+        balance_msat: (sats * 1000n).toString(),
+        status: 'ok'
       })
     }
 
