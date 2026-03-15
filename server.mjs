@@ -9,6 +9,7 @@ const HOST = process.env.SPARK_SIDECAR_HOST || '127.0.0.1'
 const API_KEY = process.env.SPARK_SIDECAR_API_KEY || ''
 let mnemonic = process.env.SPARK_MNEMONIC || ''
 const NETWORK = process.env.SPARK_NETWORK || 'MAINNET'
+const MULTIPLICITY = parseInt(process.env.SPARK_MULTIPLICITY || '3', 10)
 const PAY_WAIT_MS = parseInt(process.env.SPARK_PAY_WAIT_MS || '4000', 10)
 const PAY_POLL_MS = parseInt(process.env.SPARK_PAY_POLL_MS || '500', 10)
 const STREAM_KEEPALIVE_MS = parseInt(
@@ -164,7 +165,13 @@ async function getWallet() {
     walletPromise = SparkWallet.initialize({
       mnemonicOrSeed: mnemonic,
       accountNumber: ACCOUNT_NUMBER,
-      options: {network: NETWORK}
+      options: {
+        network: NETWORK,
+        optimizationOptions: {
+          auto: true,
+          multiplicity: MULTIPLICITY
+        }
+      }
     }).then(({wallet}) => {
       walletInstance = wallet
       attachWalletListeners(wallet)
