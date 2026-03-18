@@ -24,11 +24,12 @@ npm install
 ## Run
 
 ```
+chmod +x server.mjs
+
 SPARK_MNEMONIC="bottom bottom bottom bottom bottom bottom bottom bottom bottom bottom bottom bottom" \
 SPARK_NETWORK=MAINNET \
 SPARK_SIDECAR_PORT=8765 \
 SPARK_PAY_WAIT_MS=20000 \
-chmod +x server.mjs \
 node server.mjs
 ```
 
