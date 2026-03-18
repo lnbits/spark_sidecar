@@ -172,6 +172,9 @@ async function getWallet() {
     })
   }
   const wallet = await walletPromise
+
+  await wallet.setPrivacyEnabled(true)
+
   if (wallet && !walletListenersAttached) {
     attachWalletListeners(wallet)
   }
