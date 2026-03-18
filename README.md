@@ -16,7 +16,8 @@ https://www.spark.money/
 ## Install
 
 ```
-cd lnbits/wallets/sidecars/spark
+git clone https://github.com/lnbits/spark_sidecar.git
+cd spark_sidecar
 npm install
 ```
 
