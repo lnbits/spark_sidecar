@@ -168,14 +168,14 @@ async function getWallet() {
     }).then(({wallet}) => {
       walletInstance = wallet
       attachWalletListeners(wallet)
+      console.log('Spark wallet initialized.')
       return wallet
     })
-}
+  }
   const wallet = await walletPromise
   if (wallet && !walletListenersAttached) {
     attachWalletListeners(wallet)
   }
-  console.log('Spark wallet initialized.')
   return wallet
 }
 
