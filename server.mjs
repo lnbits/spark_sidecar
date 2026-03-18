@@ -170,7 +170,7 @@ async function getWallet() {
       attachWalletListeners(wallet)
       return wallet
     })
-  }
+}
   const wallet = await walletPromise
   if (wallet && !walletListenersAttached) {
     attachWalletListeners(wallet)
@@ -422,16 +422,6 @@ async function pollInvoiceUpdates() {
   }
 }
 
-function startInvoicePolling() {
-  if (INVOICE_POLL_MS <= 0 || invoicePollTimer) {
-    return
-  }
-  invoicePollTimer = setInterval(() => {
-    void pollInvoiceUpdates()
-  }, INVOICE_POLL_MS)
-  void pollInvoiceUpdates()
-}
-
 function stopInvoicePolling() {
   if (!invoicePollTimer) {
     return
@@ -522,8 +512,6 @@ function addSseClient(res) {
   res.on('close', () => {
     removeSseClient(res)
   })
-
-  startInvoicePolling()
 }
 
 function removeSseClient(res) {
