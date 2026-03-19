@@ -175,6 +175,7 @@ async function getWallet() {
     }).then(({wallet}) => {
       walletInstance = wallet
       attachWalletListeners(wallet)
+      console.log('Spark wallet initialized.')
       return wallet
     })
   }
@@ -185,7 +186,6 @@ async function getWallet() {
   if (wallet && !walletListenersAttached) {
     attachWalletListeners(wallet)
   }
-  console.log('Spark wallet initialized.')
   return wallet
 }
 
@@ -432,16 +432,6 @@ async function pollInvoiceUpdates() {
   }
 }
 
-function startInvoicePolling() {
-  if (INVOICE_POLL_MS <= 0 || invoicePollTimer) {
-    return
-  }
-  invoicePollTimer = setInterval(() => {
-    void pollInvoiceUpdates()
-  }, INVOICE_POLL_MS)
-  void pollInvoiceUpdates()
-}
-
 function stopInvoicePolling() {
   if (!invoicePollTimer) {
     return
@@ -532,8 +522,6 @@ function addSseClient(res) {
   res.on('close', () => {
     removeSseClient(res)
   })
-
-  startInvoicePolling()
 }
 
 function removeSseClient(res) {
