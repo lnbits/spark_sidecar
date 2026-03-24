@@ -14,3 +14,21 @@ jobs:
           tag: ${{ github.ref_name }}
         run: |
           gh release create "$tag" --generate-notes
+
+  docker:
+    needs: [ release ]
+    uses: ./.github/workflows/docker.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+
+  docker-latest:
+    needs: [ release ]
+    uses: ./.github/workflows/docker.yml
+    with:
+      tag: latest
+    secrets:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}

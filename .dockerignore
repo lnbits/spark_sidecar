@@ -1,0 +1,11 @@
+.git
+.github
+node_modules
+README.md
+flake.nix
+flake.lock
+uv.lock
+pyproject.toml
+Makefile
+.prettierignore
+.prettierrc
