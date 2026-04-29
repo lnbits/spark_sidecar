@@ -654,7 +654,9 @@ const server = http.createServer(async (req, res) => {
           paymentHashToRequestId.set(paymentHash, payment.id)
         }
         return sendJson(res, 200, {
-          checking_id: paymentHash || payment.id,
+          // checking_id: paymentHash || payment.id,
+          checking_id: payment.id,
+          payment_hash: paymentHash,
           status: payment.status,
           fee_msat: feeToMsat(payment.fee),
           preimage: payment.paymentPreimage || null
@@ -691,11 +693,20 @@ const server = http.createServer(async (req, res) => {
     if (parts.length === 3 && parts[0] === 'v1' && parts[1] === 'payments') {
       const wallet = await getWallet()
       const requestedId = parts[2]
-      const lookupId = paymentHashToRequestId.get(requestedId) || requestedId
-      const payment = await wallet.getLightningSendRequest(lookupId)
+      const lookupId = paymentHashToRequestId.get(requestedId)
+
+      if (!lookupId && /^[0-9a-fA-F]{64}$/.test(requestedId)) {
+        return sendJson(res, 404, {
+          error: 'Payment hash not mapped to Spark payment request ID',
+          checking_id: requestedId
+        })
+      }
+
+      const payment = await wallet.getLightningSendRequest(lookupId || requestedId)
       if (!payment) {
         return sendJson(res, 404, {error: 'Not found'})
       }
+
       return sendJson(res, 200, {
         checking_id: requestedId,
         status: payment.status,
