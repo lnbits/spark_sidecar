@@ -654,7 +654,6 @@ const server = http.createServer(async (req, res) => {
           paymentHashToRequestId.set(paymentHash, payment.id)
         }
         return sendJson(res, 200, {
-          // checking_id: paymentHash || payment.id,
           checking_id: payment.id,
           payment_hash: paymentHash,
           status: payment.status,
