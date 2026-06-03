@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@buildonspark/spark-sdk": "^0.7.17"
+    "@buildonspark/spark-sdk": "^0.8.2"
   },
   "devDependencies": {
     "prettier": "^3.7.4",
