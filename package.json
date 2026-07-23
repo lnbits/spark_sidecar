@@ -2,6 +2,10 @@
   "name": "lnbits-spark-sidecar",
   "private": true,
   "type": "module",
+  "scripts": {
+    "check": "node --check server.mjs && node --check sidecar-runtime.mjs",
+    "test": "node --test"
+  },
   "dependencies": {
     "@buildonspark/spark-sdk": "^0.7.1"
   },

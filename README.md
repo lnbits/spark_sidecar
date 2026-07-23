@@ -28,6 +28,7 @@ chmod +x server.mjs
 
 SPARK_MNEMONIC="bottom bottom bottom bottom bottom bottom bottom bottom bottom bottom bottom bottom" \
 SPARK_NETWORK=MAINNET \
+SPARK_ACCOUNT_NUMBER=1 \
 SPARK_SIDECAR_PORT=8765 \
 SPARK_PAY_WAIT_MS=20000 \
 node server.mjs
@@ -43,11 +44,16 @@ Default multiplicity is 3
 SPARK_MULTIPLICITY=3
 ```
 
+The account number defaults to `1` (`0` on `REGTEST`). Set
+`SPARK_ACCOUNT_NUMBER` explicitly when restoring an existing wallet.
+
 **Optional API Key**
 
 ```
 SPARK_SIDECAR_API_KEY="mykey"
 ```
+
+An API key is required when `SPARK_SIDECAR_HOST` is not a loopback host.
 
 Set the same key in LNbits as `SPARK_L2_API_KEY`.
 
@@ -89,6 +95,7 @@ Notes:
 - `POST /v1/balance`
 - `POST /v1/invoices`
 - `POST /v1/payments`
+- `GET /metrics` (Prometheus text format)
 - `GET /v1/invoices/stream` (SSE stream of paid Lightning receive requests)
 - `GET /v1/invoices/{id}`
 - `GET /v1/payments/{id}`
@@ -109,7 +116,7 @@ Each event payload is a JSON object:
 {
   "checking_id": "<receive_request_id>",
   "payment_hash": "<hash>",
-  "status": "LIGHTNING_PAYMENT_RECEIVED"
+  "status": "TRANSFER_COMPLETED"
 }
 ```
 
@@ -122,6 +129,50 @@ Optional tuning:
 - `SPARK_INVOICE_POLL_MS` (default `2000`)
 - `SPARK_INVOICE_POLL_LIMIT` (default `100`)
 - `SPARK_INVOICE_CACHE_TTL_MS` (default `3600000`)
+- `SPARK_BALANCE_RECOVERY_POLL_MS` (default `2000`)
+- `SPARK_BALANCE_RECOVERY_STABLE_READS` (default `3`)
+- `SPARK_BALANCE_RECOVERY_TIMEOUT_MS` (default `45000`)
+
+### Throughput and rate limiting
+
+The sidecar bounds concurrent payment submission and routes balance, status,
+history, and transfer lookups through one rate-limited query queue. Lower
+`SPARK_QUERY_MAX_RPS` if the Spark service applies a tighter limit. Setting a
+short payment poll interval cannot bypass this global limit. A detected HTTP
+429 or rate-limit error pauses all new queries with exponential backoff.
+
+- `SPARK_PAYMENT_CONCURRENCY` (default `8`)
+- `SPARK_PAYMENT_QUEUE_MAX` (default `64`)
+- `SPARK_PAY_WAIT_MAX_MS` (default `30000`)
+- `SPARK_PAY_POLL_MAX_ACTIVE` (default `64`)
+- `SPARK_QUERY_MAX_RPS` (default `10`)
+- `SPARK_QUERY_CONCURRENCY` (default `4`)
+- `SPARK_QUERY_QUEUE_MAX` (default `200`)
+- `SPARK_QUERY_RATE_LIMIT_BACKOFF_MS` (default `5000`)
+- `SPARK_QUERY_RATE_LIMIT_BACKOFF_MAX_MS` (default `60000`)
+- `SPARK_REQUEST_LOG` (default `false`)
+
+When the payment queue is full, the sidecar returns a structured rejection
+that explicitly states the payment was not submitted. LNbits treats every
+other submission error as ambiguous and keeps the payment pending.
+
+Payment request mappings are appended in batches rather than rewriting the
+complete state after every payment. The journal is periodically compacted into
+a bounded snapshot.
+
+- `SPARK_SIDECAR_STATE_PATH` (default `./spark-sidecar-state.json`)
+- `SPARK_PAYMENT_MAPPING_SNAPSHOT_PATH` (default
+  `<state-path>.payments.json`)
+- `SPARK_PAYMENT_MAPPING_JOURNAL_PATH` (default
+  `<state-path>.payments.log`)
+- `SPARK_STATE_PERSIST_DEBOUNCE_MS` (default `1000`)
+- `SPARK_PAYMENT_JOURNAL_COMPACT_ENTRIES` (default `5000`)
+- `SPARK_PAYMENT_JOURNAL_COMPACT_BYTES` (default `4194304`)
+- `SPARK_PAYMENT_MAPPING_MAX` (default `100000`)
+
+The authenticated `/metrics` endpoint exposes payment/query queue depth,
+submission latency, active settlement polls, Spark errors, dropped transfer
+events, and state-write latency.
 
 ## Powered by LNbits
 
