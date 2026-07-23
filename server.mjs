@@ -7,9 +7,11 @@ import {SparkWallet, SparkWalletEvent} from '@buildonspark/spark-sdk'
 import {
   BoundedWorkQueue,
   isRateLimitError,
+  OperationTimeoutError,
   PaymentMappingStore,
   QueueFullError,
-  singleFlight
+  singleFlight,
+  withTimeout
 } from './sidecar-runtime.mjs'
 
 class PaymentQueueFullError extends Error {
@@ -79,6 +81,10 @@ const BALANCE_RECOVERY_STABLE_READS = Math.max(
 const BALANCE_RECOVERY_TIMEOUT_MS = Math.max(
   0,
   parseInt(process.env.SPARK_BALANCE_RECOVERY_TIMEOUT_MS || '45000', 10)
+)
+const BALANCE_QUERY_TIMEOUT_MS = Math.max(
+  0,
+  parseInt(process.env.SPARK_BALANCE_QUERY_TIMEOUT_MS || '10000', 10)
 )
 const STATE_PATH =
   process.env.SPARK_SIDECAR_STATE_PATH ||
@@ -160,6 +166,7 @@ let walletPromise
 let walletInstance
 let walletRecoveryPromise
 let walletRecoveryStatus = 'initializing'
+let lastKnownBalance = {available: 0n, owned: 0n, incoming: 0n}
 const paymentHashToRequestId = new Map()
 const sseClients = new Set()
 const sseKeepaliveTimers = new Map()
@@ -191,6 +198,8 @@ const balanceLookupsInFlight = new Map()
 const receiveRequestLookupsInFlight = new Map()
 const transferLookupsInFlight = new Map()
 const pendingPaymentRequestIds = new Set()
+const PAYMENT_HASH_PATTERN = /^[0-9a-f]{64}$/i
+const RECEIVE_REQUEST_MAPPING_PREFIX = 'receive:'
 const metrics = {
   paymentQueueDepth: 0,
   paymentActive: 0,
@@ -335,6 +344,20 @@ function rememberPaymentRequestId(paymentHash, requestId) {
   paymentMappingStore.remember(paymentHash, requestId)
 }
 
+function isPaymentHash(value) {
+  return typeof value === 'string' && PAYMENT_HASH_PATTERN.test(value)
+}
+
+function receiveRequestMappingKey(paymentHash) {
+  return `${RECEIVE_REQUEST_MAPPING_PREFIX}${paymentHash.toLowerCase()}`
+}
+
+function rememberReceiveRequestId(paymentHash, requestId) {
+  if (isPaymentHash(paymentHash)) {
+    rememberPaymentRequestId(receiveRequestMappingKey(paymentHash), requestId)
+  }
+}
+
 function getRequestUpdatedAtMs(request) {
   const stamp = request?.updatedAt || request?.createdAt
   if (!stamp) {
@@ -380,13 +403,48 @@ function getSatsBalance(balance) {
   }
 }
 
+function observeBalance(balance) {
+  lastKnownBalance = balance
+  return balance
+}
+
+async function getSatsBalanceWithTimeout(wallet) {
+  return observeBalance(
+    getSatsBalance(
+      await withTimeout(
+        getSparkBalance(wallet),
+        BALANCE_QUERY_TIMEOUT_MS,
+        `Spark balance query timed out after ${BALANCE_QUERY_TIMEOUT_MS}ms`
+      )
+    )
+  )
+}
+
+function sendBalanceResponse(res, balance) {
+  return sendJson(res, 200, {
+    balance_sats: balance.available.toString(),
+    balance_msat: (balance.available * 1000n).toString(),
+    available_sats: balance.available.toString(),
+    owned_sats: balance.owned.toString(),
+    incoming_sats: balance.incoming.toString(),
+    status: walletRecoveryStatus
+  })
+}
+
+function markWalletRecovering(wallet) {
+  walletRecoveryStatus = 'recovering'
+  if (wallet && !walletRecoveryPromise) {
+    void startWalletRecovery(wallet)
+  }
+}
+
 async function waitForStableBalance(wallet) {
   const deadline = Date.now() + BALANCE_RECOVERY_TIMEOUT_MS
   let previousAvailable
   let stableReads = 0
 
   do {
-    const balance = getSatsBalance(await getSparkBalance(wallet))
+    const balance = await getSatsBalanceWithTimeout(wallet)
 
     if (balance.incoming === 0n && balance.available === previousAvailable) {
       stableReads += 1
@@ -798,6 +856,26 @@ function getLightningReceiveRequest(wallet, requestId) {
   )
 }
 
+async function resolveLightningReceiveRequest(wallet, requestedId) {
+  if (!isPaymentHash(requestedId)) {
+    return await getLightningReceiveRequest(wallet, requestedId)
+  }
+
+  const mappedId = paymentHashToRequestId.get(
+    receiveRequestMappingKey(requestedId)
+  )
+  if (!mappedId) {
+    return {
+      id: requestedId,
+      status: 'PENDING',
+      invoice: {paymentHash: requestedId},
+      paymentPreimage: null
+    }
+  }
+
+  return await getLightningReceiveRequest(wallet, mappedId)
+}
+
 function getTransferFromSsp(wallet, transferId) {
   return singleFlight(transferLookupsInFlight, transferId, () =>
     runSparkQuery(() => wallet.getTransferFromSsp(transferId), 5)
@@ -1015,6 +1093,7 @@ async function pollInvoiceUpdates() {
           continue
         }
         const invoice = request.invoice || {}
+        rememberReceiveRequestId(invoice.paymentHash, request.id)
         sendSseEvent({
           checking_id: request.id,
           payment_hash: invoice.paymentHash || null,
@@ -1082,6 +1161,7 @@ async function handleTransferLookup(transferId) {
       return
     }
     const invoice = userRequest.invoice || {}
+    rememberReceiveRequestId(invoice.paymentHash, userRequest.id)
     sendSseEvent({
       checking_id: userRequest.id,
       payment_hash: invoice.paymentHash || null,
@@ -1220,16 +1300,19 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, {status: 'missing_mnemonic'})
       }
       const wallet = await getWallet()
-      await startWalletRecovery(wallet)
-      const balance = getSatsBalance(await getSparkBalance(wallet))
-      return sendJson(res, 200, {
-        balance_sats: balance.available.toString(),
-        balance_msat: (balance.available * 1000n).toString(),
-        available_sats: balance.available.toString(),
-        owned_sats: balance.owned.toString(),
-        incoming_sats: balance.incoming.toString(),
-        status: walletRecoveryStatus
-      })
+      void startWalletRecovery(wallet)
+      try {
+        return sendBalanceResponse(res, await getSatsBalanceWithTimeout(wallet))
+      } catch (error) {
+        if (!(error instanceof OperationTimeoutError)) {
+          console.warn(
+            'Spark wallet balance unavailable; keeping wallet recovering:',
+            error instanceof Error ? error.message : String(error)
+          )
+        }
+        markWalletRecovering(wallet)
+        return sendBalanceResponse(res, lastKnownBalance)
+      }
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/invoices') {
@@ -1245,6 +1328,7 @@ const server = http.createServer(async (req, res) => {
         descriptionHash: body.description_hash || undefined,
         expirySeconds: body.expiry_seconds || undefined
       })
+      rememberReceiveRequestId(invoice.invoice.paymentHash, invoice.id)
       return sendJson(res, 200, {
         checking_id: invoice.id,
         payment_request: invoice.invoice.encodedInvoice,
@@ -1348,7 +1432,7 @@ const server = http.createServer(async (req, res) => {
     const parts = url.pathname.split('/').filter(Boolean)
     if (parts.length === 3 && parts[0] === 'v1' && parts[1] === 'invoices') {
       const wallet = await getWallet()
-      const invoice = await getLightningReceiveRequest(wallet, parts[2])
+      const invoice = await resolveLightningReceiveRequest(wallet, parts[2])
       if (!invoice) {
         return sendJson(res, 404, {error: 'Not found'})
       }
@@ -1367,7 +1451,7 @@ const server = http.createServer(async (req, res) => {
       let payment = lookupId
         ? await getLightningSendRequest(wallet, lookupId)
         : null
-      if (!payment && /^[0-9a-f]{64}$/i.test(requestedId)) {
+      if (!payment && isPaymentHash(requestedId)) {
         payment = await findPaymentByIdempotencyKey(wallet, requestedId)
         if (payment) {
           rememberPaymentRequestId(requestedId, payment.id)

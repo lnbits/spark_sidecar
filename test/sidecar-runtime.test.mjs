@@ -7,9 +7,11 @@ import test from 'node:test'
 import {
   BoundedWorkQueue,
   isRateLimitError,
+  OperationTimeoutError,
   PaymentMappingStore,
   QueueFullError,
-  singleFlight
+  singleFlight,
+  withTimeout
 } from '../sidecar-runtime.mjs'
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -139,6 +141,22 @@ test('singleFlight shares one in-flight operation per key', async () => {
   assert.deepEqual(results, ['result', 'result', 'result'])
   assert.equal(calls, 1)
   assert.equal(inFlight.size, 0)
+})
+
+test('withTimeout bounds waits without cancelling the underlying operation', async () => {
+  let completed = false
+  const slowOperation = delay(25).then(() => {
+    completed = true
+    return 'late'
+  })
+
+  await assert.rejects(
+    withTimeout(slowOperation, 5, 'too slow'),
+    OperationTimeoutError
+  )
+  assert.equal(await slowOperation, 'late')
+  assert.equal(completed, true)
+  assert.equal(await withTimeout(Promise.resolve('ok'), 50, 'too slow'), 'ok')
 })
 
 test('payment mappings are batched, compacted, bounded, and reloadable', async t => {

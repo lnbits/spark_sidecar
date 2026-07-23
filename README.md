@@ -132,6 +132,7 @@ Optional tuning:
 - `SPARK_BALANCE_RECOVERY_POLL_MS` (default `2000`)
 - `SPARK_BALANCE_RECOVERY_STABLE_READS` (default `3`)
 - `SPARK_BALANCE_RECOVERY_TIMEOUT_MS` (default `45000`)
+- `SPARK_BALANCE_QUERY_TIMEOUT_MS` (default `10000`)
 
 ### Throughput and rate limiting
 

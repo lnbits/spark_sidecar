@@ -7,6 +7,31 @@ export class QueueFullError extends Error {
   }
 }
 
+export class OperationTimeoutError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'OperationTimeoutError'
+  }
+}
+
+export function withTimeout(promise, timeoutMs, message) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return promise
+  }
+
+  let timer
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new OperationTimeoutError(message)),
+      timeoutMs
+    )
+  })
+
+  return Promise.race([promise, timeout]).finally(() => {
+    clearTimeout(timer)
+  })
+}
+
 export class BoundedWorkQueue {
   constructor({
     concurrency,
