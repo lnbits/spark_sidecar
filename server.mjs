@@ -40,6 +40,14 @@ const TRANSFER_QUEUE_MAX = Math.max(
   1,
   parseInt(process.env.SPARK_TRANSFER_QUEUE_MAX || '5000', 10)
 )
+const BALANCE_SETTLE_STABLE_READS = Math.max(
+  1,
+  parseInt(process.env.SPARK_BALANCE_SETTLE_STABLE_READS || '2', 10)
+)
+const BALANCE_SETTLE_MS = Math.max(
+  0,
+  parseInt(process.env.SPARK_BALANCE_SETTLE_MS || '30000', 10)
+)
 const ACCOUNT_NUMBER = process.env.SPARK_ACCOUNT_NUMBER
   ? parseInt(process.env.SPARK_ACCOUNT_NUMBER, 10)
   : undefined
@@ -78,6 +86,9 @@ let lastSeenUpdatedAtMs = 0
 let statePersistTimer = null
 let baselineInitialized = false
 let stateLoaded = false
+let lastBalanceAvailable
+let balanceStableReads = 0
+let balanceSettleNotBefore = 0
 
 const DROP_LOG_INTERVAL_MS = 10000
 
@@ -175,6 +186,7 @@ async function getWallet() {
     }).then(({wallet}) => {
       walletInstance = wallet
       attachWalletListeners(wallet)
+      balanceSettleNotBefore = Date.now() + BALANCE_SETTLE_MS
       console.log('Spark wallet initialized.')
       return wallet
     })
@@ -244,6 +256,58 @@ function feeToMsat(fee) {
     default:
       return BigInt(Math.round(value * 1000)).toString()
   }
+}
+
+function getSatsBalance(balance) {
+  const available = BigInt(
+    balance?.satsBalance?.available ?? balance?.balance ?? 0
+  )
+  return {
+    available,
+    owned: BigInt(balance?.satsBalance?.owned ?? available),
+    incoming: BigInt(balance?.satsBalance?.incoming ?? 0)
+  }
+}
+
+function observeBalanceSettlement(balance) {
+  const now = Date.now()
+  if (
+    balance.incoming > 0n ||
+    (lastBalanceAvailable !== undefined &&
+      balance.available > lastBalanceAvailable)
+  ) {
+    balanceSettleNotBefore = Math.max(
+      balanceSettleNotBefore,
+      now + BALANCE_SETTLE_MS
+    )
+  }
+
+  if (
+    balance.incoming === 0n &&
+    lastBalanceAvailable !== undefined &&
+    balance.available === lastBalanceAvailable
+  ) {
+    balanceStableReads += 1
+  } else {
+    balanceStableReads = balance.incoming === 0n ? 1 : 0
+  }
+  lastBalanceAvailable = balance.available
+
+  return {
+    balance,
+    ready:
+      balance.incoming === 0n &&
+      balanceStableReads >= BALANCE_SETTLE_STABLE_READS &&
+      now >= balanceSettleNotBefore
+  }
+}
+
+async function getSettledBalanceStatus(wallet) {
+  return observeBalanceSettlement(getSatsBalance(await wallet.getBalance()))
+}
+
+async function isWalletBalanceSettled(wallet) {
+  return (await getSettledBalanceStatus(wallet)).ready
 }
 
 function setMnemonic(nextMnemonic) {
@@ -353,6 +417,9 @@ async function pollInvoiceUpdates() {
     const now = Date.now()
     pruneEmittedInvoiceCache(now)
     const wallet = walletInstance || (await getWallet())
+    if (!(await isWalletBalanceSettled(wallet))) {
+      return
+    }
     let maxSeenUpdatedAtMs = lastSeenUpdatedAtMs
     let hasEntity = false
     let cursor = undefined
@@ -443,6 +510,9 @@ function stopInvoicePolling() {
 async function handleTransferLookup(transferId) {
   try {
     const wallet = walletInstance || (await getWallet())
+    if (!(await isWalletBalanceSettled(wallet))) {
+      return
+    }
     const transfer = await wallet.getTransferFromSsp(transferId)
     const userRequest = transfer?.userRequest
     if (!userRequest || userRequest.typename !== 'LightningReceiveRequest') {
@@ -519,6 +589,13 @@ function addSseClient(res) {
     sseHeartbeatTimers.set(res, timer)
   }
 
+  if (!invoicePollTimer && INVOICE_POLL_MS > 0) {
+    invoicePollTimer = setInterval(() => {
+      void pollInvoiceUpdates()
+    }, INVOICE_POLL_MS)
+    void pollInvoiceUpdates()
+  }
+
   res.on('close', () => {
     removeSseClient(res)
   })
@@ -586,12 +663,14 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, {status: 'missing_mnemonic'})
       }
       const wallet = await getWallet()
-      const balance = await wallet.getBalance()
-      const sats = BigInt(balance.balance)
+      const {balance, ready} = await getSettledBalanceStatus(wallet)
       return sendJson(res, 200, {
-        balance_sats: sats.toString(),
-        balance_msat: (sats * 1000n).toString(),
-        status: 'ok'
+        balance_sats: balance.available.toString(),
+        balance_msat: (balance.available * 1000n).toString(),
+        available_sats: balance.available.toString(),
+        owned_sats: balance.owned.toString(),
+        incoming_sats: balance.incoming.toString(),
+        status: ready ? 'ready' : 'recovering'
       })
     }
 
@@ -680,9 +759,14 @@ const server = http.createServer(async (req, res) => {
       if (!invoice) {
         return sendJson(res, 404, {error: 'Not found'})
       }
+      const status =
+        RECEIVE_SUCCESS_STATUSES.has(invoice.status) &&
+        !(await isWalletBalanceSettled(wallet))
+          ? 'PENDING'
+          : invoice.status
       return sendJson(res, 200, {
         checking_id: invoice.id,
-        status: invoice.status,
+        status,
         payment_hash: invoice.invoice.paymentHash,
         preimage: invoice.paymentPreimage || null
       })
