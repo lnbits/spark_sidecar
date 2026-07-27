@@ -302,12 +302,10 @@ function observeBalanceSettlement(balance) {
   }
 }
 
-async function getSettledBalanceStatus(wallet) {
-  return observeBalanceSettlement(getSatsBalance(await wallet.getBalance()))
-}
-
-async function isWalletBalanceSettled(wallet) {
-  return (await getSettledBalanceStatus(wallet)).ready
+async function getSettledBalanceStatus() {
+  const wallet = await getWallet()
+  const balance = await wallet.getBalance()
+  return observeBalanceSettlement(getSatsBalance(balance))
 }
 
 function setMnemonic(nextMnemonic) {
@@ -417,9 +415,6 @@ async function pollInvoiceUpdates() {
     const now = Date.now()
     pruneEmittedInvoiceCache(now)
     const wallet = walletInstance || (await getWallet())
-    if (!(await isWalletBalanceSettled(wallet))) {
-      return
-    }
     let maxSeenUpdatedAtMs = lastSeenUpdatedAtMs
     let hasEntity = false
     let cursor = undefined
@@ -510,9 +505,6 @@ function stopInvoicePolling() {
 async function handleTransferLookup(transferId) {
   try {
     const wallet = walletInstance || (await getWallet())
-    if (!(await isWalletBalanceSettled(wallet))) {
-      return
-    }
     const transfer = await wallet.getTransferFromSsp(transferId)
     const userRequest = transfer?.userRequest
     if (!userRequest || userRequest.typename !== 'LightningReceiveRequest') {
@@ -662,8 +654,7 @@ const server = http.createServer(async (req, res) => {
       if (!mnemonic) {
         return sendJson(res, 200, {status: 'missing_mnemonic'})
       }
-      const wallet = await getWallet()
-      const {balance, ready} = await getSettledBalanceStatus(wallet)
+      const {balance, ready} = await getSettledBalanceStatus()
       return sendJson(res, 200, {
         balance_sats: balance.available.toString(),
         balance_msat: (balance.available * 1000n).toString(),
@@ -759,14 +750,9 @@ const server = http.createServer(async (req, res) => {
       if (!invoice) {
         return sendJson(res, 404, {error: 'Not found'})
       }
-      const status =
-        RECEIVE_SUCCESS_STATUSES.has(invoice.status) &&
-        !(await isWalletBalanceSettled(wallet))
-          ? 'PENDING'
-          : invoice.status
       return sendJson(res, 200, {
         checking_id: invoice.id,
-        status,
+        status: invoice.status,
         payment_hash: invoice.invoice.paymentHash,
         preimage: invoice.paymentPreimage || null
       })
