@@ -701,7 +701,9 @@ const server = http.createServer(async (req, res) => {
         })
       }
 
-      const payment = await wallet.getLightningSendRequest(lookupId || requestedId)
+      const payment = await wallet.getLightningSendRequest(
+        lookupId || requestedId
+      )
       if (!payment) {
         return sendJson(res, 404, {error: 'Not found'})
       }
