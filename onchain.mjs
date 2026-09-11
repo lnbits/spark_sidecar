@@ -1,6 +1,17 @@
 import fs from 'node:fs/promises'
+import {OperationQueue} from './operation-queue.mjs'
 import path from 'node:path'
 import {createHash, randomUUID, timingSafeEqual} from 'node:crypto'
+import {sparkDeposits, depositReceipt} from './spark-deposits.mjs'
+import {
+  prepareLightningPayment,
+  sendLightningPayment,
+  findLightningPayment,
+  terminalPaymentStatuses,
+  decodePayment,
+  FundsUnavailableError,
+  requireAvailableFunds
+} from './lightning.mjs'
 
 const UUID =
   '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
@@ -88,6 +99,21 @@ export class OnchainJournal {
     }
   }
 
+  async remove(id) {
+    const filename = path.join(this.directory, `${id}.json`)
+    try {
+      await fs.unlink(filename)
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+    const directory = await fs.open(path.dirname(filename), 'r')
+    try {
+      await directory.sync()
+    } finally {
+      await directory.close()
+    }
+  }
+
   async put(id, value) {
     const temporary = path.join(this.directory, `${id}.${randomUUID()}.tmp`)
     const handle = await fs.open(temporary, 'wx', 0o600)
@@ -98,7 +124,7 @@ export class OnchainJournal {
       await handle.close()
     }
     await fs.rename(temporary, path.join(this.directory, `${id}.json`))
-    const directory = await fs.open(this.directory, 'r')
+    const directory = await fs.open(path.dirname(temporary), 'r')
     try {
       await directory.sync()
     } finally {
@@ -108,23 +134,37 @@ export class OnchainJournal {
 }
 
 export class OnchainService {
-  constructor({journal, getWallet, network}) {
+  constructor({
+    journal,
+    getWallet,
+    network,
+    deposits = sparkDeposits,
+    fundsWaitMs = 20_000,
+    concurrency = 8
+  }) {
+    this.deposits = deposits
     this.journal = journal
     this.getWallet = getWallet
     this.network = network
-    this.queue = Promise.resolve()
+    this.fundsWaitMs = fundsWaitMs
+    this.operations = new OperationQueue(concurrency)
+    this.historyScans = new Map()
   }
 
-  serial(work) {
-    if (this.closing) return Promise.reject(new Error('Sidecar is stopping'))
-    const result = this.queue.then(work)
-    this.queue = result.catch(() => {})
-    return result
+  waitingForFunds(error, record) {
+    return (
+      error instanceof FundsUnavailableError &&
+      (error.recoverable || Date.now() < record.funds_deadline)
+    )
+  }
+
+  serial(work, key = 'global') {
+    return this.operations.run(key, work)
   }
 
   async address(id) {
     const prior = await this.journal.get(id)
-    if (prior) return prior
+    if (prior?.address) return prior
     const record = {status: 'creating', address: null}
     await this.journal.put(id, record)
     record.address = await (await this.getWallet()).getSingleUseDepositAddress()
@@ -147,32 +187,35 @@ export class OnchainService {
     if (record.claim_hash && record.claim_hash !== fingerprint)
       throw new Error('Deposit already bound to another outpoint')
     const wallet = await this.getWallet()
-    if (!record.claim_hash) {
-      record.claim_hash = fingerprint
-      record.status = 'claiming'
-      await this.journal.put(id, record)
-      // LNbits verifies confirmations and the returned root input's txid/vout.
-      // A lost claim response is NOT permission to claim a second deposit.
-      const leaves = await wallet.claimDeposit(data.txid)
-      record.leaves = leaves.map(leaf => ({
-        id: leaf.id,
-        value: integer(leaf.value, 1),
-        node_tx: leaf.nodeTx,
-        available: leaf.status === 'AVAILABLE'
-      }))
-      record.status = 'claimed'
-      await this.journal.put(id, record)
-    }
-    if (record.leaves?.some(leaf => !leaf.available)) {
-      const available = new Set(
-        (await wallet.getLeaves())
-          .filter(leaf => leaf.status === 'AVAILABLE')
-          .map(leaf => leaf.id)
+    if (!record.leaves?.length || record.leaves.some(leaf => !leaf.available)) {
+      const recovered = await this.deposits.recover(
+        wallet,
+        data,
+        record.leaves,
+        record.address
       )
-      for (const leaf of record.leaves) {
-        if (available.has(leaf.id)) leaf.available = true
+      if (recovered.length) {
+        record.leaves = depositReceipt(recovered, data)
+        record.claim_hash = fingerprint
+        record.status = 'claimed'
+        await this.journal.put(id, record)
+      } else if (!record.leaves?.length) {
+        // Preparation only reads Spark state. Failures remain retryable.
+        record.prepared ||= await this.deposits.prepare(
+          wallet,
+          record.address,
+          data
+        )
+        record.claim_hash = fingerprint
+        record.status = 'claiming'
+        await this.journal.put(id, record)
+        // Every attempt uses the same validated raw transaction and vout.
+        // It can never advance to another swap's output after a lost response.
+        const leaves = await this.deposits.claim(wallet, record.prepared)
+        record.leaves = depositReceipt(leaves, data)
+        record.status = 'claimed'
+        await this.journal.put(id, record)
       }
-      await this.journal.put(id, record)
     }
     return {
       available: Boolean(
@@ -199,13 +242,21 @@ export class OnchainService {
     if (record) {
       if (record.request_hash !== fingerprint)
         throw new Error('Conflicting withdrawal request')
-      return record
+      if (!['WAITING_FOR_FUNDS', 'quoting'].includes(record.status))
+        return record
     }
-    record = {...normalized, request_hash: fingerprint, status: 'quoting'}
+    record = {
+      ...record,
+      ...normalized,
+      request_hash: fingerprint,
+      status: 'quoting',
+      funds_deadline: record?.funds_deadline ?? Date.now() + this.fundsWaitMs
+    }
     await this.journal.put(id, record)
-    const wallet = await this.getWallet()
-    let quote
+    let wallet, quote
     try {
+      wallet = await this.getWallet()
+      await requireAvailableFunds(wallet, data.amount_sats)
       quote = await wallet.getWithdrawalFeeQuote({
         amountSats: data.amount_sats,
         withdrawalAddress: data.address
@@ -217,8 +268,11 @@ export class OnchainService {
       )
         throw new Error('Fee quote rejected')
       record.fee_sats = fee
-    } catch {
-      record.status = 'rejected'
+      await requireAvailableFunds(wallet, data.amount_sats + fee)
+    } catch (error) {
+      record.status = this.waitingForFunds(error, record)
+        ? 'WAITING_FOR_FUNDS'
+        : 'rejected'
       await this.journal.put(id, record)
       return record
     }
@@ -251,60 +305,143 @@ export class OnchainService {
     if (!/^[0-9a-f]{64}$/.test(hashValue))
       throw new Error('Invalid payment hash')
     const id = `ln-${hashValue}`
+    const queued = await this.journal.get(id)
+    if (!data && ['WAITING_FOR_FUNDS', 'PREPARING'].includes(queued?.status)) {
+      // Resume only the durable intent authorized by the original POST.
+      data = queued.payment
+    }
     if (data) {
       if (typeof data.bolt11 !== 'string' || data.bolt11.length > 4096)
         throw new Error('Invalid invoice')
       integer(data.max_fee_sats, 0, 100_000_000)
       const fingerprint = hash({
         bolt11: data.bolt11,
-        max_fee_sats: data.max_fee_sats
+        max_fee_sats: data.max_fee_sats,
+        amount_sats: data.amount_sats
       })
       const previous = await this.journal.get(id)
-      if (previous && previous.request_hash !== fingerprint)
+      if (
+        previous &&
+        !previous.not_sent &&
+        previous.request_hash !== fingerprint
+      )
         throw new Error('Conflicting Lightning payment')
-      if (!previous) {
+      if (
+        !previous ||
+        previous.not_sent ||
+        ['WAITING_FOR_FUNDS', 'PREPARING'].includes(previous.status)
+      ) {
         const intent = {
           checking_id: hashValue,
           request_hash: fingerprint,
-          status: 'UNKNOWN'
+          status: 'PREPARING',
+          payment: {
+            bolt11: data.bolt11,
+            max_fee_sats: data.max_fee_sats,
+            amount_sats: data.amount_sats
+          },
+          funds_deadline:
+            previous && !previous.not_sent
+              ? (previous.funds_deadline ?? Date.now() + this.fundsWaitMs)
+              : Date.now() + this.fundsWaitMs
         }
         await this.journal.put(id, intent)
+        const params = {
+          invoice: data.bolt11,
+          maxFeeSats: data.max_fee_sats,
+          amountSatsToSend: data.amount_sats
+        }
+        let wallet
         try {
-          const result = await (
-            await this.getWallet()
-          ).payLightningInvoice({
-            invoice: data.bolt11,
-            maxFeeSats: data.max_fee_sats
-          })
-          if (result?.id) intent.request_id = result.id
+          wallet = await this.getWallet()
+          await prepareLightningPayment(wallet, params, this.network)
+        } catch (error) {
+          const waiting = this.waitingForFunds(error, intent)
+          intent.status = waiting
+            ? 'WAITING_FOR_FUNDS'
+            : 'LIGHTNING_PAYMENT_FAILED'
+          intent.not_sent = !waiting
+          intent.fee_msat = waiting ? null : 0
+          await this.journal.put(id, intent)
+          return {
+            checking_id: hashValue,
+            payment_hash: hashValue,
+            status: intent.status,
+            fee_msat: intent.fee_msat,
+            preimage: null
+          }
+        }
+        intent.status = 'UNKNOWN'
+        await this.journal.put(id, intent)
+        try {
+          const result = await sendLightningPayment(wallet, params)
+          if (result) this.updatePayment(intent, result)
         } catch {
-          // An SDK rejection can occur after the external side effect. Keep pending.
+          // Reconcile uncertain dispatches against history; never resend them.
         }
         await this.journal.put(id, intent)
       }
     }
-    const record = await this.journal.get(id)
-    if (!record?.request_id) return {checking_id: hashValue, status: 'UNKNOWN'}
-    const result = await (
-      await this.getWallet()
-    ).getLightningSendRequest(record.request_id)
-    if (result) {
-      record.status = result.status
-      record.fee_msat = result.fee ? msats(result.fee) : null
-      record.preimage = result.paymentPreimage || null
-      await this.journal.put(id, record)
+    // Also reconcile payments sent before this journal was introduced.
+    const record = (await this.journal.get(id)) || {
+      checking_id: hashValue,
+      status: 'UNKNOWN'
+    }
+    if (!terminalPaymentStatuses.has(record.status)) {
+      try {
+        const wallet = await this.getWallet()
+        const result = record.request_id
+          ? await wallet.getLightningSendRequest(record.request_id)
+          : await this.findPayment(wallet, hashValue)
+        if (result) {
+          this.updatePayment(record, result)
+          await this.journal.put(id, record)
+        }
+      } catch {
+        // A lookup outage must not hide a durable send result or trigger a resend.
+      }
     }
     return {
       checking_id: hashValue,
+      payment_hash: hashValue,
       status: record.status,
       fee_msat: record.fee_msat,
       preimage: record.preimage
     }
   }
 
+  async findPayment(wallet, paymentHash) {
+    let scan = this.historyScans.get(paymentHash)
+    if (scan?.complete && Date.now() < scan.retryAt) return null
+    if (!scan || scan.complete) scan = {}
+    this.historyScans.delete(paymentHash)
+    this.historyScans.set(paymentHash, scan)
+    if (this.historyScans.size > 1024)
+      this.historyScans.delete(this.historyScans.keys().next().value)
+    // Continue long histories across polls instead of monopolizing a worker.
+    try {
+      const result = await findLightningPayment(wallet, paymentHash, scan, 2)
+      if (scan.complete) scan.retryAt = Date.now() + 5000
+      return result
+    } catch (error) {
+      this.historyScans.delete(paymentHash)
+      throw error
+    }
+  }
+
+  updatePayment(record, result) {
+    if (result.id) record.request_id = result.id
+    record.status = result.status || record.status
+    record.preimage = result.paymentPreimage || record.preimage || null
+    record.fee_msat = result.fee ? msats(result.fee) : null
+    record.not_sent = result.not_sent === true
+  }
+
   async withdrawal(id) {
     const record = await this.journal.get(id)
     if (!record) return {status: 'unknown'}
+    if (['WAITING_FOR_FUNDS', 'quoting'].includes(record.status))
+      return this.withdraw(id, record)
     if (!record.request_id) return record
     const result = await (
       await this.getWallet()
@@ -323,13 +460,24 @@ export async function createOnchainHandler({
   getWallet,
   network,
   apiKey,
-  directory
+  directory,
+  onchainEnabled = true,
+  waitMs = 0,
+  pollMs = 500,
+  fundsWaitMs = 20_000,
+  concurrency = 8
 }) {
-  if (!apiKey || apiKey.length < 32)
+  if (onchainEnabled && (!apiKey || apiKey.length < 32))
     throw new Error('Onchain API requires a key of at least 32 characters')
   const journal = new OnchainJournal(directory)
   await journal.initialize()
-  const service = new OnchainService({journal, getWallet, network})
+  const service = new OnchainService({
+    journal,
+    getWallet,
+    network,
+    fundsWaitMs,
+    concurrency
+  })
   const reply = (res, status, value) => {
     res.writeHead(status, {
       'content-type': 'application/json',
@@ -339,14 +487,19 @@ export async function createOnchainHandler({
   }
   const handler = async (req, res, url) => {
     const lightning = url.pathname.match(
-      /^\/v1\/payments(?:\/([0-9a-f]{64}))?$/
+      /^\/v1\/payments(?:\/([0-9a-f]{64}))?$/i
     )
-    if (!url.pathname.startsWith('/v1/onchain/') && !lightning) return false
+    if (
+      (!onchainEnabled || !url.pathname.startsWith('/v1/onchain/')) &&
+      !lightning
+    )
+      return false
     const supplied = req.headers['x-api-key']
     if (
-      typeof supplied !== 'string' ||
-      Buffer.byteLength(supplied) !== Buffer.byteLength(apiKey) ||
-      !timingSafeEqual(Buffer.from(supplied), Buffer.from(apiKey))
+      apiKey &&
+      (typeof supplied !== 'string' ||
+        Buffer.byteLength(supplied) !== Buffer.byteLength(apiKey) ||
+        !timingSafeEqual(Buffer.from(supplied), Buffer.from(apiKey)))
     ) {
       reply(res, 401, {error: 'Unauthorized'})
       return true
@@ -357,25 +510,62 @@ export async function createOnchainHandler({
       let result
       if (lightning && req.method === 'POST' && !lightning[1]) {
         const data = await body(req)
-        result = await service.serial(() =>
-          service.lightning(data.payment_hash, data)
+        const decodedHash = decodePayment(data.bolt11).hash
+        if (
+          data.payment_hash &&
+          data.payment_hash.toLowerCase() !== decodedHash
         )
+          throw new Error('Invoice payment hash mismatch')
+        result = await service.serial(
+          () => service.lightning(decodedHash, data),
+          `ln-${decodedHash}`
+        )
+        const deadline = Date.now() + Math.max(0, waitMs)
+        while (
+          !terminalPaymentStatuses.has(result.status) &&
+          Date.now() < deadline &&
+          !service.closing
+        ) {
+          await new Promise(resolve =>
+            setTimeout(
+              resolve,
+              Math.min(Math.max(1, pollMs), deadline - Date.now())
+            )
+          )
+          result = await service.serial(
+            () => service.lightning(decodedHash),
+            `ln-${decodedHash}`
+          )
+        }
       } else if (lightning && req.method === 'GET' && lightning[1]) {
-        result = await service.serial(() => service.lightning(lightning[1]))
+        result = await service.serial(
+          () => service.lightning(lightning[1].toLowerCase()),
+          `ln-${lightning[1].toLowerCase()}`
+        )
       } else if (req.method === 'GET' && url.pathname === '/v1/onchain/info') {
         result = {version: 1, network, required_confirmations: 3}
       } else if (deposit && req.method === 'PUT' && !deposit[2]) {
-        result = await service.serial(() => service.address(deposit[1]))
+        result = await service.serial(
+          () => service.address(deposit[1]),
+          deposit[1]
+        )
       } else if (deposit && req.method === 'POST' && deposit[2]) {
         const data = await body(req)
-        result = await service.serial(() => service.claim(deposit[1], data))
+        result = await service.serial(
+          () => service.claim(deposit[1], data),
+          deposit[1]
+        )
       } else if (withdrawal && req.method === 'PUT') {
         const data = await body(req)
-        result = await service.serial(() =>
-          service.withdraw(withdrawal[1], data)
+        result = await service.serial(
+          () => service.withdraw(withdrawal[1], data),
+          withdrawal[1]
         )
       } else if (withdrawal && req.method === 'GET') {
-        result = await service.serial(() => service.withdrawal(withdrawal[1]))
+        result = await service.serial(
+          () => service.withdrawal(withdrawal[1]),
+          withdrawal[1]
+        )
       } else {
         reply(res, 404, {error: 'Not found'})
         return true
@@ -389,9 +579,10 @@ export async function createOnchainHandler({
     }
     return true
   }
+  handler.journal = journal
   handler.close = async () => {
     service.closing = true
-    await service.queue
+    await service.operations.close()
     await journal.close()
   }
   return handler

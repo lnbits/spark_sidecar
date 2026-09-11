@@ -1,3 +1,5 @@
 spark-sidecar-state.json
 node_modules/
 result
+
+onchain/

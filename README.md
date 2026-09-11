@@ -49,7 +49,8 @@ SPARK_MULTIPLICITY=3
 SPARK_SIDECAR_API_KEY="mykey"
 ```
 
-Set the same key in LNbits as `SPARK_L2_API_KEY`.
+Set the same key in LNbits as `SPARK_L2_EXTERNAL_API_KEY`, and point
+`SPARK_L2_EXTERNAL_ENDPOINT` at this sidecar.
 
 If you prefer to provide the mnemonic after startup, omit `SPARK_MNEMONIC` and
 POST it to the sidecar:
@@ -95,7 +96,21 @@ Notes:
 
 ### Invoice Stream
 
-The stream endpoint emits Server-Sent Events when a Lightning invoice is paid.
+The stream endpoint emits Server-Sent Events after the received Spark funds have
+cleared. Both invoice status lookups and stream notifications check the invoice's
+own incoming transfer and its leaves. A Lightning success status alone is not
+enough: uncleared receipts return `WAITING_FOR_FUNDS`, which SparkL2 maps to pending.
+The check requires a completed transfer and available leaves registered in the
+SDK's local cache. Completed splits/aggregations also prove prior availability.
+The sidecar persists that proof so spending the leaves later cannot reverse an
+invoice's paid status.
+
+Transfer events trigger checks immediately. While a stream client is connected,
+polling discovers missed events and retries uncleared receipts. Pending receipts
+survive restart; the discovery watermark advances only after they are recorded.
+Startup loads a separate durable pending index, without scanning settled receipts.
+The availability check reads the pinned SDK's internal leaf registry; review
+`incoming.mjs` when upgrading the SDK.
 
 Example:
 
@@ -121,7 +136,34 @@ Optional tuning:
 - `SPARK_TRANSFER_QUEUE_MAX` (default `5000`)
 - `SPARK_INVOICE_POLL_MS` (default `2000`)
 - `SPARK_INVOICE_POLL_LIMIT` (default `100`)
-- `SPARK_INVOICE_CACHE_TTL_MS` (default `3600000`)
+
+### Payment concurrency and waiting for funds
+
+`SPARK_OPERATION_CONCURRENCY` (default `8`, positive integer) limits concurrent
+outgoing operation workflows. Incoming receipt checks have a separate pool of
+the same size. Different operation IDs run concurrently; duplicate requests for
+one ID serialize and cannot dispatch it twice. Concurrent balance refreshes share
+one SDK call. Long outgoing history scans continue across polls, at most two pages
+per lookup. Incoming discovery reads at most four pages per polling pass. Slow
+stream clients are disconnected when their write buffers fill.
+
+Outgoing payments also check spendable funds including quoted fees before
+dispatch. `SPARK_FUNDS_WAIT_MS` (default `20000`) allows time for missing funds to
+appear. Tracked incoming or temporarily locked funds keep the payment pending
+while they clear. Status polls resume the original recorded intent; this waiting
+does not occupy a worker between polls. This grace period does not limit how long
+incoming invoices wait for availability.
+
+`SPARK_PAY_WAIT_MS` (default `4000`) controls how long a payment POST polls before
+returning its current status; SparkL2 can continue polling pending payments.
+`SPARK_PAY_POLL_MS` defaults to `500`. Keep the POST wait below LNbits' request
+timeout, allowing time for SDK calls.
+
+Mock burst tests cover hundreds of concurrent requests, bounded overlap and
+duplicate suppression. They do not establish live Spark capacity: signing and
+operator latency, leaf distribution, wallet liquidity, and journal storage latency
+still affect throughput. Use one sidecar writer per wallet and persistent journal
+storage; adding sidecar replicas against the same wallet is not supported.
 
 ## Powered by LNbits
 
@@ -130,27 +172,43 @@ Optional tuning:
 [![Visit LNbits Shop](https://img.shields.io/badge/Visit-LNbits%20Shop-7C3AED?logo=shopping-cart&logoColor=white&labelColor=5B21B6)](https://shop.lnbits.com/)
 [![Try myLNbits SaaS](https://img.shields.io/badge/Try-myLNbits%20SaaS-2563EB?logo=lightning&logoColor=white&labelColor=1E40AF)](https://my.lnbits.com/login)
 
-
 ## Private onchain swaps
 
 Set `SPARK_ONCHAIN_ENABLED=true` to enable the authenticated onchain protocol for
 SwapSatsPrivate. `SPARK_SIDECAR_API_KEY` must contain at least 32 characters.
 Set `SPARK_ONCHAIN_STATE_DIR` to persistent private storage; it defaults to the
 `onchain` directory beside `SPARK_SIDECAR_STATE_PATH`. Keep the sidecar reachable
-only by your LNbits service. No additional dependency is required.
+only by your LNbits service.
 
-The optional handler provides unique single-use deposit addresses, Spark deposit
-claim evidence, capped cooperative withdrawals, and durable Lightning payment
-lookup. All send intents and request IDs are persisted before responding; an
+The optional onchain handler provides unique single-use deposit addresses, Spark
+deposit claim evidence, and capped cooperative withdrawals. Lightning sends use
+the durable journal whether or not onchain mode is enabled. All send intents and
+request IDs are persisted before responding; an
 ambiguous result is retained and never automatically resent. The existing
 Lightning API paths remain unchanged. Enable this mode before accepting swaps.
 
 Run one writer. Back up its journal with the LNbits databases. Do not delete
 operation files to retry payments. Graceful shutdown removes `writer.lock`; after
 a crash verify that the previous writer has stopped before removing a stale
-lock. Missing external request IDs require reconciliation against Spark history.
+lock. Ensure your process supervisor forwards shutdown signals to the sidecar;
+a wrapper that backgrounds Node and then replaces itself with LNbits does not do
+this. Lightning requests with missing external IDs are looked up in Spark history
+by payment hash; only an unambiguous successful settlement can resolve them.
+An older failed attempt cannot prove a newer attempt failed. Other missing-ID
+results remain pending and are never resent.
+Known failures before dispatch return `LIGHTNING_PAYMENT_FAILED`, which SparkL2
+recognizes as a failed payment. Persist the journal directory in Lightning-only
+installations too. A payment proven not to have been sent can be retried by POST;
+successful or uncertain sends are never dispatched again.
 
-Run `make test-onchain` for mock-based protocol, durability and duplicate-send
-tests. Test with the exact deployed Spark SDK and network before using real funds.
-The inspected checkout declared SDK `^0.9.0` but had `0.7.1` installed; resolve
-that mismatch explicitly as part of deployment.
+Deposit claims validate the address, amount, transaction ID and output index.
+Retries use the same output, and lost responses are recovered from Spark's nodes.
+The deposit adapter uses SDK internals because the public transaction-ID-only
+claim API cannot select an output. The SDK is pinned to `0.9.0`; review
+`spark-deposits.mjs` and run its contract tests before upgrading.
+
+Run `make test-onchain` for mock-based protocol, receipt availability, durability,
+concurrency and duplicate-send tests. Run `make test-server` for localhost HTTP/SSE
+integration tests using a mocked SDK (no Spark network access or funds).
+Test with the exact deployed Spark SDK and network before using real funds.
+The invoice decoder is declared directly and is already a dependency of the Spark SDK.

@@ -5,7 +5,7 @@ all: format check
 
 format: prettier
 
-check: pyright checkprettier
+check: pyright checkprettier test-onchain
 
 
 prettier:
@@ -34,3 +34,8 @@ mypy:
 test-onchain:
 	node --check server.mjs
 	node onchain.test.mjs
+	node incoming.test.mjs
+
+.PHONY: test-server
+test-server:
+	node server.test.mjs
