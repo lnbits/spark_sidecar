@@ -1,5 +1,5 @@
 // Test-only wallet. This loader never connects to Spark or handles real funds.
-import {readFileSync} from 'node:fs'
+import {readFileSync, writeFileSync, renameSync} from 'node:fs'
 import {EventEmitter} from 'node:events'
 const state = () =>
   JSON.parse(readFileSync(process.env.SPARK_TEST_STATE, 'utf8'))
@@ -23,10 +23,45 @@ export const SparkWallet = {
       if (data.outage) throw new Error('mock outage')
       return id === 'receive-test' ? invoice(data) : null
     }
-    wallet.getUserRequests = async () => ({
-      entities: [invoice(state())],
-      pageInfo: {hasNextPage: false}
-    })
+    wallet.getUserRequests = async ({types}) => {
+      const data = state()
+      if (data.outage) throw new Error('mock outage')
+      return {
+        entities: types.includes('LIGHTNING_SEND')
+          ? data.sendRequest
+            ? [data.sendRequest]
+            : []
+          : [invoice(data)],
+        pageInfo: {hasNextPage: false}
+      }
+    }
+    wallet.getLightningSendRequest = async id => {
+      const data = state()
+      if (data.outage) throw new Error('mock outage')
+      return data.sendRequest?.id === id ? data.sendRequest : null
+    }
+    wallet.getLightningSendFeeEstimate = async () => 1
+    wallet.payLightningInvoice = async params => {
+      const data = state()
+      if (!data.sendRequest) {
+        data.sendRequest = {
+          id: 'spark-send-request',
+          typename: 'LightningSendRequest',
+          status: 'CREATED',
+          encodedInvoice: params.invoice,
+          fee: {originalUnit: 'SATOSHI', originalValue: 1}
+        }
+        data.idempotencyKey = params.idempotencyKey
+        data.submissions = (data.submissions || 0) + 1
+        // This file represents the external Spark service in the test. It is
+        // outside the sidecar working directory and is never a sidecar journal.
+        const filename = process.env.SPARK_TEST_STATE
+        writeFileSync(`${filename}.provider-tmp`, JSON.stringify(data))
+        renameSync(`${filename}.provider-tmp`, filename)
+      }
+      if (data.loseSendResponse) throw new Error('mock lost response')
+      return data.sendRequest
+    }
     wallet.getTransferFromSsp = async () => ({userRequest: invoice(state())})
     wallet.getTransfer = async () => ({
       id: 'transfer-test',

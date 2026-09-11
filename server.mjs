@@ -1,6 +1,4 @@
-import fs from 'node:fs'
 import http from 'node:http'
-import path from 'node:path'
 
 import {createPaymentHandler} from './payments.mjs'
 import {IncomingInvoices, receiveSuccessStatuses} from './incoming.mjs'
@@ -43,14 +41,6 @@ const TRANSFER_QUEUE_MAX = Math.max(
 const ACCOUNT_NUMBER = process.env.SPARK_ACCOUNT_NUMBER
   ? parseInt(process.env.SPARK_ACCOUNT_NUMBER, 10)
   : undefined
-const STATE_PATH =
-  process.env.SPARK_SIDECAR_STATE_PATH ||
-  path.join(process.cwd(), 'spark-sidecar-state.json')
-const STATE_PERSIST_DEBOUNCE_MS = parseInt(
-  process.env.SPARK_STATE_PERSIST_DEBOUNCE_MS || '1000',
-  10
-)
-
 let mnemonicReadyResolve
 const mnemonicReady = new Promise(resolve => {
   mnemonicReadyResolve = resolve
@@ -77,52 +67,9 @@ let lastDropLog = 0
 let invoicePollTimer = null
 let invoicePollInFlight = false
 let lastSeenUpdatedAtMs = Date.now()
-let statePersistTimer = null
 let invoiceScan = null
 
 const DROP_LOG_INTERVAL_MS = 10000
-
-loadState()
-
-function loadState() {
-  try {
-    if (!fs.existsSync(STATE_PATH)) {
-      return
-    }
-    const raw = fs.readFileSync(STATE_PATH, 'utf8')
-    const parsed = JSON.parse(raw)
-    if (Number.isFinite(parsed?.lastSeenUpdatedAtMs)) {
-      lastSeenUpdatedAtMs = parsed.lastSeenUpdatedAtMs
-    }
-  } catch {
-    console.error('Error loading Spark sidecar state')
-  }
-}
-
-async function persistState() {
-  try {
-    await fs.promises.writeFile(
-      STATE_PATH,
-      JSON.stringify({lastSeenUpdatedAtMs}),
-      'utf8'
-    )
-  } catch {
-    console.error('Error persisting Spark sidecar state')
-  }
-}
-
-function scheduleStatePersist() {
-  if (statePersistTimer) {
-    return
-  }
-  statePersistTimer = setTimeout(
-    () => {
-      statePersistTimer = null
-      void persistState()
-    },
-    Math.max(0, STATE_PERSIST_DEBOUNCE_MS)
-  )
-}
 
 function getRequestUpdatedAtMs(request) {
   const stamp = request?.updatedAt || request?.createdAt
@@ -225,26 +172,6 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'))
 }
 
-function feeToMsat(fee) {
-  if (!fee || fee.originalValue === undefined || !fee.originalUnit) {
-    return null
-  }
-  const value = Number(fee.originalValue)
-  if (!Number.isFinite(value)) {
-    return null
-  }
-  switch (fee.originalUnit) {
-    case 'MILLISATOSHI':
-      return BigInt(Math.round(value)).toString()
-    case 'SATOSHI':
-      return BigInt(Math.round(value * 1000)).toString()
-    case 'BITCOIN':
-      return BigInt(Math.round(value * 100_000_000_000)).toString()
-    default:
-      return BigInt(Math.round(value * 1000)).toString()
-  }
-}
-
 function setMnemonic(nextMnemonic) {
   if (!nextMnemonic) {
     return {status: 'missing'}
@@ -334,7 +261,7 @@ async function pollInvoiceUpdates() {
         invoiceScan.maxSeen = Math.max(invoiceScan.maxSeen, stamp)
         observations.push(incomingInvoices.observe(request))
       }
-      // Every candidate is durable before advancing the discovery watermark.
+      // Remember uncleared candidates for this stream session before advancing.
       const results = await Promise.allSettled(observations)
       const failed = results.find(result => result.status === 'rejected')
       if (failed) throw failed.reason
@@ -342,7 +269,6 @@ async function pollInvoiceUpdates() {
       if (!info.hasNextPage || reachedKnown) {
         lastSeenUpdatedAtMs = invoiceScan.maxSeen
         invoiceScan = null
-        scheduleStatePersist()
         break
       }
       if (!info.endCursor || info.endCursor === invoiceScan.cursor)
@@ -473,23 +399,14 @@ paymentHandler = await createPaymentHandler({
   fundsWaitMs: Math.max(
     0,
     parseInt(process.env.SPARK_FUNDS_WAIT_MS || '20000', 10)
-  ),
-  directory:
-    process.env.SPARK_PAYMENT_STATE_DIR ||
-    // Reuse journals from the earlier combined build; never lose send intents.
-    process.env.SPARK_ONCHAIN_STATE_DIR ||
-    (fs.existsSync(path.join(path.dirname(STATE_PATH), 'onchain'))
-      ? path.join(path.dirname(STATE_PATH), 'onchain')
-      : path.join(path.dirname(STATE_PATH), 'payments'))
+  )
 })
 
 incomingInvoices = new IncomingInvoices({
-  journal: paymentHandler.journal,
   getWallet,
   emit: sendSseEvent,
   concurrency: Number(process.env.SPARK_OPERATION_CONCURRENCY || 8)
 })
-await incomingInvoices.initialize()
 
 server = http.createServer(async (req, res) => {
   const url = new URL(
@@ -566,7 +483,10 @@ server = http.createServer(async (req, res) => {
 
     const parts = url.pathname.split('/').filter(Boolean)
     if (parts.length === 3 && parts[0] === 'v1' && parts[1] === 'invoices') {
-      const invoice = await incomingInvoices.observe({id: parts[2]})
+      const invoice = await incomingInvoices.observe(
+        {id: decodeURIComponent(parts[2])},
+        {notify: false}
+      )
       if (!invoice) {
         return sendJson(res, 404, {error: 'Not found'})
       }
@@ -575,23 +495,6 @@ server = http.createServer(async (req, res) => {
         status: invoice.status,
         payment_hash: invoice.invoice.paymentHash,
         preimage: invoice.paymentPreimage || null
-      })
-    }
-
-    if (parts.length === 3 && parts[0] === 'v1' && parts[1] === 'payments') {
-      const wallet = await getWallet()
-      const requestedId = parts[2]
-      // Legacy clients may still use an opaque Spark request ID.
-      const payment = await wallet.getLightningSendRequest(requestedId)
-      if (!payment) {
-        return sendJson(res, 404, {error: 'Not found'})
-      }
-
-      return sendJson(res, 200, {
-        checking_id: requestedId,
-        status: payment.status,
-        fee_msat: feeToMsat(payment.fee),
-        preimage: payment.paymentPreimage || null
       })
     }
 

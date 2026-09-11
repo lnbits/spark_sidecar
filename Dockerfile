@@ -1,12 +1,8 @@
 FROM node:20-bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends util-linux \
-    && rm -rf /var/lib/apt/lists/*
-
 ENV NODE_ENV=production \
     SPARK_SIDECAR_HOST=0.0.0.0 \
-    SPARK_SIDECAR_PORT=8765 \
-    SPARK_SIDECAR_STATE_PATH=/data/spark-sidecar-state.json
+    SPARK_SIDECAR_PORT=8765
 
 WORKDIR /app
 
@@ -14,13 +10,11 @@ COPY package.json package-lock.json ./
 
 RUN npm ci --omit=dev && npm cache clean --force
 
-COPY server.mjs payments.mjs payment-journal.mjs lightning.mjs incoming.mjs operation-queue.mjs ./
+COPY server.mjs payments.mjs lightning.mjs incoming.mjs operation-queue.mjs ./
 
-RUN mkdir -p /data && chown -R node:node /app /data
+RUN chown -R node:node /app
 
 USER node
-
-VOLUME ["/data"]
 
 EXPOSE 8765
 

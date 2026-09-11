@@ -1,26 +1,58 @@
 import assert from 'node:assert/strict'
-import {mkdtemp, readFile, writeFile, rm} from 'node:fs/promises'
-import {tmpdir} from 'node:os'
-import path from 'node:path'
 import test from 'node:test'
 import {Readable} from 'node:stream'
 import {bech32} from '@scure/base'
-import {PaymentJournal} from './payment-journal.mjs'
-import {PaymentService, createPaymentHandler} from './payments.mjs'
 import {
   SparkValidationError,
   SparkWallet,
   Network
 } from '@buildonspark/spark-sdk'
+import {getLightningSendRequestQuery} from '@buildonspark/spark-sdk/types'
+import {PaymentService, createPaymentHandler} from './payments.mjs'
 import {
   decodePayment,
   prepareLightningPayment,
   sendLightningPayment
 } from './lightning.mjs'
 
-const invoice =
-  'lnbc20u1p3y0x3hpp5743k2g0fsqqxj7n8qzuhns5gmkk4djeejk3wkp64ppevgekvc0jsdqcve5kzar2v9nr5gpqd4hkuetesp5ez2g297jduwc20t6lmqlsg3man0vf2jfd8ar9fh8fhn2g8yttfkqxqy9gcqcqzys9qrsgqrzjqtx3k77yrrav9hye7zar2rtqlfkytl094dsp0ms5majzth6gt7ca6uhdkxl983uywgqqqqlgqqqvx5qqjqrzjqd98kxkpyw0l9tyy8r8q57k7zpy9zjmh6sez752wj6gcumqnj3yxzhdsmg6qq56utgqqqqqqqqqqqeqqjq7jd56882gtxhrjm03c93aacyfy306m4fq0tskf83c0nmet8zc2lxyyg3saz8x6vwcp26xnrlagf9semau3qm2glysp7sv95693fphvsp54l567'
+import {invoice} from './test/invoice.mjs'
 const paymentHash = decodePayment(invoice).hash
+const money = value => ({originalUnit: 'SATOSHI', originalValue: value})
+const data = {bolt11: invoice, max_fee_sats: 10}
+const request = (
+  status = 'LIGHTNING_PAYMENT_SUCCEEDED',
+  id = 'spark-request'
+) => ({
+  id,
+  typename: 'LightningSendRequest',
+  status,
+  encodedInvoice: invoice,
+  fee: money(2),
+  paymentPreimage: 'proof'
+})
+const page = (entities = [], after) => ({
+  entities,
+  pageInfo: {hasNextPage: Boolean(after), endCursor: after}
+})
+function setup(t, overrides = {}, config = {}) {
+  const wallet = {
+    getBalance: async () => ({balance: 1000000n}),
+    getLightningSendFeeEstimate: async () => 0,
+    getUserRequests: async () => page(),
+    getLightningSendRequest: async () => null,
+    payLightningInvoice: async () => request(),
+    ...overrides
+  }
+  const options = {
+    getWallet: async () => wallet,
+    network: 'MAINNET',
+    fundsWaitMs: 0,
+    ...config
+  }
+  const service = new PaymentService(options)
+  t.after(() => service.operations.close())
+  return {wallet, service, options}
+}
 
 test('preflight and SDK dispatch enforce the same fee limit for either invoice case', async () => {
   const wallet = Object.create(SparkWallet.prototype)
@@ -58,295 +90,377 @@ test('preflight and SDK dispatch enforce the same fee limit for either invoice c
   }
 })
 
-test('preflight failures persist safe reasons without exposing SDK error contents', async t => {
-  const secret = 'MOCK_MNEMONIC_MUST_NOT_LEAK'
-  const logs = []
-  t.mock.method(console, 'warn', message => logs.push(message))
-  for (const [method, code] of [
-    ['getLightningSendFeeEstimate', 'FEE_QUOTE_UNAVAILABLE'],
-    ['getBalance', 'BALANCE_UNAVAILABLE']
-  ]) {
-    const {service, journal} = await setup(t, {
-      [method]: async () => {
-        throw new Error(secret)
-      },
-      payLightningInvoice: async () => assert.fail('must not dispatch')
-    })
-    const result = await service.lightning(paymentHash, {
-      bolt11: invoice,
-      max_fee_sats: 2
-    })
-    assert.equal(result.status, 'LIGHTNING_PAYMENT_FAILED')
-    assert.equal(result.failure_code, code)
-    const saved = await journal.get(`ln-${paymentHash}`)
-    assert.equal(saved.not_sent, true)
-    assert.equal(saved.failure_code, code)
-    assert.equal((await service.lightning(paymentHash)).failure_code, code)
-    assert(!JSON.stringify([result, saved, logs]).includes(secret))
+test('the pinned SDK passes the sidecar idempotency key to its preimage-swap service', async t => {
+  const sdk = Object.create(SparkWallet.prototype)
+  const keys = []
+  sdk.config = {
+    getNetwork: () => Network.MAINNET,
+    getSspIdentityPublicKey: () => `02${'1'.repeat(64)}`
   }
-})
-
-test('concurrent HTTP payments retain independent queues and suppress duplicate sends', async t => {
-  const directory = await mkdtemp('/tmp/spark-lightning-volume-')
-  let active = 0,
-    peak = 0
-  const sent = new Set()
-  const handler = await createPaymentHandler({
-    directory,
+  sdk.getSspClient = () => ({
+    getUserRequests: async () => page(),
+    getLightningSendFeeEstimate: async () => ({
+      feeEstimate: {originalUnit: 'SATOSHI', originalValue: 1}
+    }),
+    requestLightningSend: async ({userOutboundTransferExternalId}) => {
+      assert.equal(userOutboundTransferExternalId, 'provider-transfer')
+      return request()
+    }
+  })
+  sdk.getBalance = async () => ({balance: 1000000n})
+  sdk.getCachedBalance = sdk.getBalance
+  sdk.leafManager = {
+    selectLeavesAndExecute: async (_, callback) => callback([[]]),
+    handleTransferEvent: async () => {}
+  }
+  sdk.transferService = {prepareTransferForLightning: async () => ({})}
+  sdk.lightningService = {
+    swapNodesForPreimage: async params => {
+      keys.push(params.idempotencyKey)
+      return {transfer: {id: 'provider-transfer'}}
+    }
+  }
+  const options = {
+    getWallet: async () => sdk,
     network: 'MAINNET',
-    apiKey: 'test-key',
-    concurrency: 8,
-    getWallet: async () => ({
-      getBalance: async () => ({balance: 10000000n}),
-      getLightningSendFeeEstimate: async () => 0,
-      payLightningInvoice: async ({invoice}) => {
-        const hash = decodePayment(invoice).hash
-        assert(!sent.has(hash))
-        sent.add(hash)
-        peak = Math.max(peak, ++active)
-        await new Promise(resolve => setTimeout(resolve, 20))
-        active--
-        return {id: hash, status: 'LIGHTNING_PAYMENT_SUCCEEDED', fee: money(0)}
-      }
-    })
-  })
-  t.after(async () => {
-    await handler.close()
-    await rm(directory, {recursive: true})
-  })
-  // Synthetic invoice hashes exercise HTTP routing; the sending wallet is mocked.
-  const encoded = bech32.decode(invoice, 5000)
-  const invoices = Array.from({length: 100}, (_, index) => {
-    const words = [...encoded.words]
-    assert.equal(words[7], 1) // BOLT11 payment_hash tag in the fixture.
-    const hash = Buffer.from(index.toString(16).padStart(64, '0'), 'hex')
-    words.splice(10, 52, ...bech32.toWords(hash))
-    return bech32.encode(encoded.prefix, words, 5000)
-  })
-  const results = await Promise.all(
-    [...invoices, ...invoices].map(async bolt11 => {
-      const req = Readable.from([
-        Buffer.from(JSON.stringify({bolt11, max_fee_sats: 10}))
-      ])
-      req.method = 'POST'
-      req.headers = {'x-api-key': 'test-key'}
-      let code, response
-      await handler(
-        req,
-        {
-          writeHead: value => {
-            code = value
-          },
-          end: value => {
-            response = JSON.parse(value)
-          }
-        },
-        new URL('/v1/payments', 'http://localhost')
-      )
-      assert.equal(code, 200)
-      assert.equal(response.status, 'LIGHTNING_PAYMENT_SUCCEEDED')
-      return response
-    })
-  )
-  assert.equal(sent.size, 100)
-  assert.equal(peak, 8)
-  for (let i = 0; i < 100; i++) assert.deepEqual(results[i], results[i + 100])
+    fundsWaitMs: 0
+  }
+  for (const bolt11 of [invoice, invoice.toUpperCase()]) {
+    const service = new PaymentService(options)
+    t.after(() => service.operations.close())
+    assert.equal(
+      (await service.lightning(paymentHash, {...data, bolt11})).status,
+      'LIGHTNING_PAYMENT_SUCCEEDED'
+    )
+  }
+  assert.equal(keys.length, 2)
+  assert.match(keys[0], /^[0-9a-f]{64}$/)
+  assert.equal(keys[0], keys[1])
 })
 
-const money = amount => ({originalUnit: 'SATOSHI', originalValue: amount})
-async function setup(t, wallet) {
-  wallet = {
-    getLightningSendFeeEstimate: async () => 0,
-    getBalance: async () => ({balance: 1000000n}),
-    ...wallet
-  }
-  const directory = await mkdtemp(path.join(tmpdir(), 'spark-payments-'))
-  const journal = new PaymentJournal(directory)
-  await journal.initialize()
-  t.after(async () => {
-    await journal.close()
-    await rm(directory, {recursive: true})
+test('new checking IDs are Spark IDs and survive replacement without sidecar state', async t => {
+  let status = 'CREATED',
+    sends = 0
+  const {service, options} = setup(t, {
+    payLightningInvoice: async () => {
+      sends++
+      return request(status)
+    },
+    getLightningSendRequest: async id => {
+      assert.equal(id, 'spark-request')
+      return request(status)
+    }
   })
-  return {
-    journal,
-    directory,
-    service: new PaymentService({
-      journal,
-      getWallet: async () => wallet,
-      network: 'MAINNET',
-      fundsWaitMs: 0
-    })
-  }
-}
+  const sent = await service.lightning(paymentHash, data)
+  assert.equal(sent.checking_id, 'spark-request')
+  assert.equal(sent.status, 'CREATED')
+  const replacement = new PaymentService(options)
+  status = 'LIGHTNING_PAYMENT_SUCCEEDED'
+  const checked = await replacement.lightning(sent.checking_id)
+  assert.equal(checked.status, status)
+  assert.equal(checked.preimage, 'proof')
+  assert.equal(checked.fee_msat, 2000)
+  assert.equal(sends, 1)
+  status = 'LIGHTNING_PAYMENT_FAILED'
+  assert.equal(
+    (await new PaymentService(options).lightning(sent.checking_id)).status,
+    status
+  )
+})
 
-test('long Lightning history scans continue across polls with a two-page work budget', async t => {
-  let calls = 0
-  const {service} = await setup(t, {
-    getUserRequests: async ({after}) => {
-      calls++
-      const page = Number(after || 0)
-      return {
-        entities:
-          page === 0
-            ? [
-                {
-                  id: 'success',
-                  typename: 'LightningSendRequest',
-                  invoice: {paymentHash},
-                  status: 'LIGHTNING_PAYMENT_SUCCEEDED',
-                  fee: money(0)
-                }
-              ]
-            : [],
-        pageInfo: {hasNextPage: page < 4, endCursor: String(page + 1)}
+test('Spark receives a stable idempotency key across restarts, casing and fee changes', async t => {
+  const keys = new Set()
+  let transfers = 0
+  const {service, options} = setup(t, {
+    // Simulate provider history lag: deduplication must not depend on local data.
+    payLightningInvoice: async params => {
+      assert.equal(params.preferSpark, false)
+      assert.match(params.idempotencyKey, /^[0-9a-f]{64}$/)
+      if (!keys.has(params.idempotencyKey)) {
+        keys.add(params.idempotencyKey)
+        transfers++
       }
+      return request()
+    }
+  })
+  await service.lightning(paymentHash, data)
+  await new PaymentService(options).lightning(paymentHash, {
+    ...data,
+    bolt11: invoice.toUpperCase(),
+    max_fee_sats: 20
+  })
+  assert.equal(transfers, 1)
+})
+
+test('an already paid invoice is recovered from Spark even with an empty balance', async t => {
+  const {service} = setup(t, {
+    getUserRequests: async () => page([request()]),
+    getBalance: async () =>
+      assert.fail('must not require funds to check a paid invoice'),
+    payLightningInvoice: async () => assert.fail('must not resubmit')
+  })
+  assert.equal(
+    (await service.lightning(paymentHash, data)).status,
+    'LIGHTNING_PAYMENT_SUCCEEDED'
+  )
+})
+
+test('lost send response recovers through Spark history after replacement', async t => {
+  let visible = false,
+    calls = 0
+  const {service, options} = setup(t, {
+    payLightningInvoice: async () => {
+      calls++
+      throw new Error('lost response')
+    },
+    getUserRequests: async () => page(visible ? [request()] : [])
+  })
+  assert.equal((await service.lightning(paymentHash, data)).status, 'UNKNOWN')
+  visible = true
+  assert.equal(
+    (await new PaymentService(options).lightning(paymentHash)).status,
+    'LIGHTNING_PAYMENT_SUCCEEDED'
+  )
+  assert.equal(calls, 1)
+})
+
+test('hash recovery matches outgoing invoices parsed by SDK 0.9.0', async t => {
+  const providerRequest = getLightningSendRequestQuery(
+    'spark-request'
+  ).constructObject({
+    entity: {
+      lightning_send_request_id: 'spark-request',
+      lightning_send_request_encoded_invoice: invoice.toUpperCase(),
+      lightning_send_request_status: 'LIGHTNING_PAYMENT_SUCCEEDED',
+      lightning_send_request_network: 'MAINNET',
+      lightning_send_request_fee: {
+        currency_amount_original_unit: 'SATOSHI',
+        currency_amount_original_value: 2
+      },
+      lightning_send_request_payment_preimage: 'proof'
+    }
+  })
+  assert.equal(providerRequest.invoice, undefined)
+  const {service} = setup(t, {
+    getUserRequests: async () => page([providerRequest]),
+    payLightningInvoice: async () =>
+      assert.fail('status recovery must not send')
+  })
+  const result = await service.lightning(paymentHash)
+  assert.equal(result.status, 'LIGHTNING_PAYMENT_SUCCEEDED')
+  assert.equal(result.checking_id, paymentHash)
+  assert.equal(result.payment_hash, paymentHash)
+  assert.equal(result.fee_msat, 2000)
+  assert.equal(result.preimage, 'proof')
+})
+
+test('unknown, absent and mismatched provider responses never settle or resend', async t => {
+  for (const response of [
+    null,
+    request('CREATED'),
+    request('LIGHTNING_PAYMENT_SUCCEEDED', 'wrong-id')
+  ]) {
+    const {service} = setup(t, {
+      getLightningSendRequest: async () => response,
+      payLightningInvoice: async () => assert.fail('GET cannot send')
+    })
+    assert(
+      ['UNKNOWN', 'CREATED'].includes(
+        (await service.lightning('spark-request')).status
+      )
+    )
+  }
+  const {service} = setup(t, {
+    getLightningSendRequest: async () => {
+      throw new Error('outage')
+    }
+  })
+  assert.equal((await service.lightning('spark-request')).status, 'UNKNOWN')
+})
+
+test('hash recovery ignores missing, malformed and unrelated outgoing invoices', async t => {
+  for (const encodedInvoice of [undefined, 'invalid invoice', invoice]) {
+    const {service} = setup(t, {
+      getUserRequests: async () => page([{...request(), encodedInvoice}]),
+      payLightningInvoice: async () =>
+        assert.fail('status recovery must not send')
+    })
+    assert.equal((await service.lightning('0'.repeat(64))).status, 'UNKNOWN')
+  }
+  const {service} = setup(t, {
+    payLightningInvoice: async () => ({
+      ...request(),
+      encodedInvoice: 'invalid invoice'
+    })
+  })
+  assert.equal((await service.lightning(paymentHash, data)).status, 'UNKNOWN')
+})
+
+test('old hash-based checking IDs never infer failure from an earlier attempt', async t => {
+  for (const entities of [
+    [request('LIGHTNING_PAYMENT_FAILED')],
+    [request('LIGHTNING_PAYMENT_FAILED'), request('CREATED', 'second')],
+    [request(), request('CREATED', 'second')]
+  ]) {
+    const {service} = setup(t, {getUserRequests: async () => page(entities)})
+    assert.equal((await service.lightning(paymentHash)).status, 'UNKNOWN')
+  }
+})
+
+test('submissions do not restart failed or ambiguous legacy attempts', async t => {
+  for (const entities of [
+    [request('LIGHTNING_PAYMENT_FAILED')],
+    [request('LIGHTNING_PAYMENT_FAILED'), request('CREATED', 'second')],
+    [request(), request('CREATED', 'second')]
+  ]) {
+    const {service} = setup(t, {
+      getUserRequests: async () => page(entities),
+      payLightningInvoice: async () =>
+        assert.fail('must not start another attempt')
+    })
+    for (let attempt = 0; attempt < 2; attempt++)
+      assert.equal(
+        (await service.lightning(paymentHash, data)).status,
+        'UNKNOWN'
+      )
+  }
+})
+
+test('long history scans are bounded per check and continue until the payment is found', async t => {
+  const afters = []
+  const {service} = setup(t, {
+    getUserRequests: async ({after}) => {
+      afters.push(after)
+      if (!after) return page([], 'a')
+      if (after === 'a') return page([], 'b')
+      if (after === 'b') return page([], 'c')
+      return page([request()])
     }
   })
   assert.equal((await service.lightning(paymentHash)).status, 'UNKNOWN')
-  assert.equal(calls, 2)
-  assert.equal((await service.lightning(paymentHash)).status, 'UNKNOWN')
-  assert.equal(calls, 4)
+  assert.equal(afters.length, 2)
   assert.equal(
     (await service.lightning(paymentHash)).status,
     'LIGHTNING_PAYMENT_SUCCEEDED'
   )
-  assert.equal(calls, 5)
+  assert.deepEqual(afters, [undefined, 'a', 'b', 'c'])
 })
 
-test('durability failure prevents sending', async t => {
-  const {service, journal} = await setup(t, {
+test('malformed history never proves success', async t => {
+  for (const providerPage of [
+    null,
+    {},
+    {entities: []},
+    page([request()], 'repeat')
+  ]) {
+    const {service} = setup(t, {getUserRequests: async () => providerPage})
+    assert.equal((await service.lightning(paymentHash)).status, 'UNKNOWN')
+  }
+})
+
+for (const [method, code] of [
+  ['getLightningSendFeeEstimate', 'FEE_QUOTE_UNAVAILABLE'],
+  ['getBalance', 'BALANCE_UNAVAILABLE']
+]) {
+  test(`safe ${code} diagnostics do not expose SDK exceptions`, async t => {
+    const logs = [],
+      secret = 'MOCK_MNEMONIC_MUST_NOT_LEAK'
+    t.mock.method(console, 'warn', value => logs.push(value))
+    const {service} = setup(t, {
+      [method]: async () => {
+        throw new Error(secret)
+      },
+      payLightningInvoice: async () => assert.fail('must not send')
+    })
+    const result = await service.lightning(paymentHash, data)
+    assert.equal(result.status, 'LIGHTNING_PAYMENT_FAILED')
+    assert.equal(result.failure_code, code)
+    assert(!JSON.stringify([result, logs]).includes(secret))
+  })
+}
+
+test('fee allowance is enforced and its safe diagnostic includes both amounts', async t => {
+  const {service} = setup(t, {
+    getLightningSendFeeEstimate: async () => 11,
     payLightningInvoice: async () => assert.fail('must not send')
   })
-  journal.put = async () => {
-    throw new Error('disk full')
-  }
-  await assert.rejects(
-    service.lightning(paymentHash, {bolt11: invoice, max_fee_sats: 10})
-  )
-})
-
-test('journal corruption fails closed and exclusive writer lock is enforced', async t => {
-  const {directory, journal} = await setup(t, {})
-  await writeFile(path.join(directory, 'bad.json'), '{corrupt')
-  await assert.rejects(journal.get('bad'))
-  await assert.rejects(new PaymentJournal(directory).initialize())
-  await journal.put('good', {state: 'submitted'})
-  assert.deepEqual(
-    JSON.parse(await readFile(path.join(directory, 'good.json'), 'utf8')),
-    {state: 'submitted'}
-  )
-})
-
-test('Lightning request ID survives restart and duplicate calls do not resend', async t => {
-  let payments = 0
-  const wallet = {
-    payLightningInvoice: async () => {
-      payments++
-      return {id: 'ln-request'}
-    },
-    getLightningSendRequest: async () => ({
-      status: 'LIGHTNING_PAYMENT_SUCCEEDED',
-      fee: money(2),
-      paymentPreimage: 'preimage'
-    })
-  }
-  const {service, journal} = await setup(t, wallet)
-  const hash = paymentHash
-  const data = {bolt11: invoice, max_fee_sats: 10}
+  const result = await service.lightning(paymentHash, data)
+  assert.equal(result.status, 'LIGHTNING_PAYMENT_FAILED')
+  assert.equal(result.failure_code, 'FEE_LIMIT_EXCEEDED')
   assert.equal(
-    (await service.lightning(hash, data)).status,
+    result.error_message,
+    'Spark fee quote (11 sats) exceeds the payment fee limit (10 sats)'
+  )
+})
+
+test('funds can clear within the original send request', async t => {
+  let reads = 0,
+    sends = 0
+  const {service} = setup(
+    t,
+    {
+      getBalance: async () => ({balance: ++reads === 1 ? 0n : 1000000n}),
+      payLightningInvoice: async () => {
+        sends++
+        return request()
+      }
+    },
+    {fundsWaitMs: 15}
+  )
+  assert.equal(
+    (await service.lightning(paymentHash, data)).status,
     'LIGHTNING_PAYMENT_SUCCEEDED'
   )
-  const restarted = new PaymentService({
-    journal,
-    getWallet: async () => wallet,
-    network: 'REGTEST'
-  })
-  assert.equal((await restarted.lightning(hash)).fee_msat, 2000)
-  await restarted.lightning(hash, data)
-  assert.equal(payments, 1)
+  assert.equal(sends, 1)
 })
 
-test('ambiguous Lightning failure retains a durable pending intent', async t => {
-  let payments = 0
-  const {service} = await setup(t, {
-    payLightningInvoice: async () => {
-      payments++
-      throw new Error('lost response')
-    }
-  })
-  const hash = paymentHash
-  const data = {bolt11: invoice, max_fee_sats: 10}
-  assert.equal((await service.lightning(hash, data)).status, 'UNKNOWN')
-  assert.equal((await service.lightning(hash, data)).status, 'UNKNOWN')
-  assert.equal(payments, 1)
+test('unavailable funds are not queued and later status checks never dispatch', async t => {
+  let available = 0n
+  const {service, options} = setup(
+    t,
+    {
+      getBalance: async () => ({
+        balance: available,
+        satsBalance: {available, owned: 1000000n, incoming: 0n}
+      }),
+      payLightningInvoice: async () => assert.fail('no background/GET dispatch')
+    },
+    {fundsWaitMs: 10}
+  )
+  const failed = await service.lightning(paymentHash, data)
+  assert.equal(failed.status, 'LIGHTNING_PAYMENT_FAILED')
+  assert.equal(failed.failure_code, 'FUNDS_UNAVAILABLE')
+  available = 1000000n
+  assert.equal(
+    (await new PaymentService(options).lightning(paymentHash)).status,
+    'UNKNOWN'
+  )
 })
 
-for (const [unit, value] of [
-  ['MILLISATOSHI', 2000],
-  ['BITCOIN', 2e-8]
-]) {
-  test(`Lightning fee conversion supports ${unit} without rounding`, async t => {
-    const {service} = await setup(t, {
-      payLightningInvoice: async () => ({id: 'request'}),
-      getLightningSendRequest: async () => ({
-        status: 'LIGHTNING_PAYMENT_SUCCEEDED',
-        fee: {originalUnit: unit, originalValue: value}
-      })
-    })
-    assert.equal(
-      (
-        await service.lightning(paymentHash, {
-          bolt11: invoice,
-          max_fee_sats: 10
-        })
-      ).fee_msat,
-      2000
-    )
-  })
-}
+test('disconnecting before dispatch cancels a funds wait', async t => {
+  const abort = new AbortController()
+  const {service} = setup(
+    t,
+    {
+      getBalance: async () => {
+        abort.abort()
+        return {balance: 0n}
+      },
+      payLightningInvoice: async () =>
+        assert.fail('must not dispatch after cancellation')
+    },
+    {fundsWaitMs: 100}
+  )
+  assert.equal(
+    (await service.lightning(paymentHash, data, abort.signal)).status,
+    'LIGHTNING_PAYMENT_FAILED'
+  )
+})
 
-for (const reason of ['fee', 'balance', 'network', 'invoice']) {
-  test(`Lightning ${reason} rejection returns durable failure without sending`, async t => {
-    let calls = 0
-    const {service} = await setup(t, {
-      getLightningSendFeeEstimate: async () => (reason === 'fee' ? 11 : 0),
-      getBalance: async () => ({balance: reason === 'balance' ? 0n : 1000000n}),
-      payLightningInvoice: async () => {
-        calls++
-        assert.fail('must not send')
-      }
-    })
-    if (reason === 'network') service.network = 'REGTEST'
-    const result = await service.lightning(paymentHash, {
-      bolt11: reason === 'invoice' ? 'invalid' : invoice,
-      max_fee_sats: 10
-    })
-    assert.equal(result.status, 'LIGHTNING_PAYMENT_FAILED')
-    if (reason === 'fee') {
-      assert.equal(result.failure_code, 'FEE_LIMIT_EXCEEDED')
-      assert.equal(
-        result.error_message,
-        'Spark fee quote (11 sats) exceeds the payment fee limit (10 sats)'
-      )
-      assert.equal(
-        (await service.lightning(paymentHash)).error_message,
-        result.error_message
-      )
-    }
-    assert.equal(
-      (await service.lightning(paymentHash)).status,
-      'LIGHTNING_PAYMENT_FAILED'
-    )
-    assert.equal(calls, 0)
-  })
-}
-
-test('only known pre-dispatch SDK validation errors are terminal failures', async () => {
+test('only known pre-dispatch SDK validation errors are explicit failures', async () => {
   const safe = new SparkValidationError(
     'maxFeeSats does not cover fee estimate'
   )
-  const unsafe = new SparkValidationError('Invalid SSP response after send')
   assert.equal(
     (
       await sendLightningPayment(
@@ -357,14 +471,15 @@ test('only known pre-dispatch SDK validation errors are terminal failures', asyn
         },
         {}
       )
-    ).status,
-    'LIGHTNING_PAYMENT_FAILED'
+    ).not_sent,
+    true
   )
+  const ambiguous = new SparkValidationError('Invalid SSP response after send')
   await assert.rejects(
     sendLightningPayment(
       {
         payLightningInvoice: async () => {
-          throw unsafe
+          throw ambiguous
         }
       },
       {}
@@ -372,347 +487,121 @@ test('only known pre-dispatch SDK validation errors are terminal failures', asyn
   )
 })
 
-test('lost Lightning response reconciles by hash through paginated Spark history', async t => {
-  let sends = 0
-  const {service} = await setup(t, {
-    payLightningInvoice: async () => {
-      sends++
-      throw new Error('response lost')
-    },
-    getUserRequests: async ({after}) =>
-      after
-        ? {
-            entities: [
-              {
-                id: 'recovered',
-                typename: 'LightningSendRequest',
-                invoice: {paymentHash},
-                status: 'LIGHTNING_PAYMENT_SUCCEEDED',
-                paymentPreimage: 'proof',
-                fee: money(2)
-              }
-            ],
-            pageInfo: {hasNextPage: false}
-          }
-        : {entities: [], pageInfo: {hasNextPage: true, endCursor: 'next'}}
-  })
-  const result = await service.lightning(paymentHash, {
-    bolt11: invoice,
-    max_fee_sats: 10
-  })
-  assert.equal(result.status, 'LIGHTNING_PAYMENT_SUCCEEDED')
-  assert.equal(result.preimage, 'proof')
-  await service.lightning(paymentHash, {bolt11: invoice, max_fee_sats: 10})
-  assert.equal(sends, 1)
-})
-
-test('a terminal send response survives an unavailable status lookup', async t => {
-  const {service} = await setup(t, {
-    payLightningInvoice: async () => ({
-      id: 'request',
-      status: 'LIGHTNING_PAYMENT_SUCCEEDED',
-      paymentPreimage: 'proof',
-      fee: money(1)
-    }),
-    getLightningSendRequest: async () => {
-      throw new Error('lookup unavailable')
-    }
-  })
-  const result = await service.lightning(paymentHash, {
-    bolt11: invoice,
-    max_fee_sats: 10
-  })
-  assert.equal(result.status, 'LIGHTNING_PAYMENT_SUCCEEDED')
-  assert.equal(result.preimage, 'proof')
-  assert.equal(result.fee_msat, 1000)
-})
-
-test('historical Lightning payments without a journal entry can still be looked up', async t => {
-  const {service} = await setup(t, {
-    getUserRequests: async () => ({
-      entities: [
-        {
-          id: 'old-payment',
-          typename: 'LightningSendRequest',
-          invoice: {paymentHash},
-          status: 'LIGHTNING_PAYMENT_SUCCEEDED',
-          fee: money(1)
-        }
-      ],
-      pageInfo: {hasNextPage: false}
+for (const [unit, value, expected] of [
+  ['MILLISATOSHI', 1234, 1234],
+  ['SATOSHI', '1.234', 1234],
+  ['BITCOIN', '0.00000001234', 1234]
+]) {
+  test(`provider ${unit} fee is converted exactly`, async t => {
+    const {service} = setup(t, {
+      getLightningSendRequest: async () => ({
+        ...request(),
+        fee: {originalUnit: unit, originalValue: value}
+      })
     })
+    assert.equal((await service.lightning('spark-request')).fee_msat, expected)
   })
-  assert.equal(
-    (await service.lightning(paymentHash)).status,
-    'LIGHTNING_PAYMENT_SUCCEEDED'
-  )
-})
+}
 
-test('Lightning-only HTTP mode preserves authentication, hash derivation and failed status', async t => {
-  const {Readable} = await import('node:stream')
-  const directory = await mkdtemp(
-    path.join(tmpdir(), 'sidecar-lightning-http-')
+async function http(handler, method, url, payload, apiKey = 'test') {
+  const req = Readable.from(
+    payload ? [Buffer.from(JSON.stringify(payload))] : []
   )
-  const handler = await createPaymentHandler({
-    directory,
-    network: 'MAINNET',
-    apiKey: 'legacy-short-key',
-    getWallet: async () => ({
-      getLightningSendFeeEstimate: async () => 100,
-      payLightningInvoice: async () =>
-        assert.fail('over-cap payment must not send')
-    })
-  })
-  t.after(async () => {
-    await handler.close()
-    await rm(directory, {recursive: true})
-  })
-  async function request(method, resource, data, key = 'legacy-short-key') {
-    const req = Readable.from(data ? [Buffer.from(JSON.stringify(data))] : [])
-    req.method = method
-    req.headers = {'x-api-key': key}
-    let status, result
-    const handled = await handler(
-      req,
-      {
-        writeHead: code => {
-          status = code
-        },
-        end: value => {
-          result = JSON.parse(value)
-        }
+  req.method = method
+  req.headers = {'x-api-key': apiKey}
+  let status, result
+  await handler(
+    req,
+    {
+      writeHead: code => {
+        status = code
       },
-      new URL(resource, 'http://localhost')
-    )
-    return {handled, status, result}
-  }
-  assert.equal((await request('GET', '/v1/onchain/info')).handled, false)
+      end: text => {
+        result = JSON.parse(text)
+      }
+    },
+    new URL(url, 'http://localhost')
+  )
+  return {status, result}
+}
+
+test('HTTP compatibility covers authentication, invoice hashes and opaque Spark IDs', async t => {
+  const {options} = setup(t, {
+    getLightningSendRequest: async id =>
+      request('LIGHTNING_PAYMENT_SUCCEEDED', id)
+  })
+  const handler = await createPaymentHandler({...options, apiKey: 'test'})
+  t.after(() => handler.close())
   assert.equal(
-    (
-      await request(
-        'POST',
-        '/v1/payments',
-        {bolt11: invoice, max_fee_sats: 10},
-        'bad'
-      )
-    ).status,
+    (await http(handler, 'POST', '/v1/payments', data, 'wrong')).status,
     401
   )
-  const sent = await request('POST', '/v1/payments', {
-    bolt11: invoice,
-    max_fee_sats: 10
-  })
-  assert.equal(sent.status, 200)
-  assert.equal(sent.result.checking_id, paymentHash)
-  assert.equal(sent.result.status, 'LIGHTNING_PAYMENT_FAILED')
-  assert.equal(
-    (await request('GET', `/v1/payments/${paymentHash.toUpperCase()}`)).result
-      .status,
-    'LIGHTNING_PAYMENT_FAILED'
-  )
   assert.equal(
     (
-      await request('POST', '/v1/payments', {
-        bolt11: invoice,
-        max_fee_sats: 10,
-        payment_hash: '00'.repeat(32)
+      await http(handler, 'POST', '/v1/payments', {
+        ...data,
+        payment_hash: '0'.repeat(64)
       })
     ).status,
     409
   )
+  const sent = await http(handler, 'POST', '/v1/payments', data)
+  assert.equal(sent.result.checking_id, 'spark-request')
+  const checked = await http(
+    handler,
+    'GET',
+    '/v1/payments/Spark%3Aopaque%2F%3D'
+  )
+  assert.equal(checked.result.checking_id, 'Spark:opaque/=')
+  assert.equal(checked.result.status, 'LIGHTNING_PAYMENT_SUCCEEDED')
 })
 
-test('ambiguous Lightning history never proves failure or causes a resend', async t => {
-  let sends = 0
-  const {service} = await setup(t, {
-    payLightningInvoice: async () => {
-      sends++
-      throw new Error('lost response')
-    },
-    getUserRequests: async () => ({
-      entities: [1, 2].map(id => ({
-        id: String(id),
-        typename: 'LightningSendRequest',
-        invoice: {paymentHash},
-        status: 'LIGHTNING_PAYMENT_FAILED'
-      })),
-      pageInfo: {hasNextPage: false}
-    })
-  })
-  assert.equal(
-    (await service.lightning(paymentHash, {bolt11: invoice, max_fee_sats: 10}))
-      .status,
-    'UNKNOWN'
-  )
-  assert.equal(
-    (await service.lightning(paymentHash, {bolt11: invoice, max_fee_sats: 10}))
-      .status,
-    'UNKNOWN'
-  )
-  assert.equal(sends, 1)
-})
-
-test('a known pre-dispatch rejection can be retried after correcting its fee cap', async t => {
-  let sends = 0
-  const {service} = await setup(t, {
-    getLightningSendFeeEstimate: async () => 20,
-    payLightningInvoice: async () => {
-      sends++
-      return {
-        id: 'request',
-        status: 'LIGHTNING_PAYMENT_SUCCEEDED',
-        fee: money(20)
-      }
-    }
-  })
-  assert.equal(
-    (await service.lightning(paymentHash, {bolt11: invoice, max_fee_sats: 10}))
-      .status,
-    'LIGHTNING_PAYMENT_FAILED'
-  )
-  assert.equal(
-    (await service.lightning(paymentHash, {bolt11: invoice, max_fee_sats: 20}))
-      .status,
-    'LIGHTNING_PAYMENT_SUCCEEDED'
-  )
-  await service.lightning(paymentHash, {bolt11: invoice, max_fee_sats: 20})
-  assert.equal(sends, 1)
-})
-
-for (const oldStatus of ['LIGHTNING_PAYMENT_FAILED', 'CREATED']) {
-  test(`an older ${oldStatus} attempt cannot resolve a newer ambiguous send`, async t => {
-    let sends = 0
-    const {service, journal} = await setup(t, {
-      payLightningInvoice: async () => {
-        sends++
-        throw new Error('lost response after new send')
-      },
-      getUserRequests: async () => ({
-        entities: [
-          {
-            id: 'old-attempt',
-            typename: 'LightningSendRequest',
-            invoice: {paymentHash},
-            createdAt: '2020-01-01T00:00:00Z',
-            status: oldStatus
-          }
-        ],
-        pageInfo: {hasNextPage: false}
-      }),
-      getLightningSendRequest: async () =>
-        assert.fail('must not bind the old request ID')
-    })
-    assert.equal(
-      (
-        await service.lightning(paymentHash, {
-          bolt11: invoice,
-          max_fee_sats: 10
+test('concurrent invoices and duplicate POSTs stay separate with provider deduplication', async t => {
+  const sent = new Map(),
+    activeHashes = new Set()
+  let peak = 0
+  const {options} = setup(t, {
+    payLightningInvoice: async params => {
+      const hash = decodePayment(params.invoice).hash
+      assert(!activeHashes.has(hash))
+      activeHashes.add(hash)
+      peak = Math.max(peak, activeHashes.size)
+      await new Promise(resolve => setTimeout(resolve, 5))
+      activeHashes.delete(hash)
+      if (!sent.has(params.idempotencyKey))
+        sent.set(params.idempotencyKey, {
+          ...request(),
+          id: `spark-${hash}`,
+          encodedInvoice: params.invoice
         })
-      ).status,
-      'UNKNOWN'
+      return sent.get(params.idempotencyKey)
+    }
+  })
+  const handler = await createPaymentHandler({...options, apiKey: 'test'})
+  t.after(() => handler.close())
+  const encoded = bech32.decode(invoice, 5000)
+  const invoices = Array.from({length: 100}, (_, i) => {
+    const words = [...encoded.words]
+    words.splice(
+      10,
+      52,
+      ...bech32.toWords(Buffer.from(i.toString(16).padStart(64, '0'), 'hex'))
     )
-    assert.equal((await journal.get(`ln-${paymentHash}`)).request_id, undefined)
-    assert.equal((await service.lightning(paymentHash)).status, 'UNKNOWN')
-    assert.equal(sends, 1)
+    return bech32.encode(encoded.prefix, words, 5000)
   })
-}
-
-test('Lightning waits for locally locked funds even when the coordinator shows a balance', async t => {
-  let available = 0n,
-    sends = 0
-  const {service} = await setup(t, {
-    getBalance: async () => ({balance: 100000n}),
-    getCachedBalance: async () => ({
-      satsBalance: {available, owned: 100000n, incoming: 0n}
-    }),
-    payLightningInvoice: async () => {
-      sends++
-      return {id: 'payment', status: 'LIGHTNING_PAYMENT_SUCCEEDED'}
-    }
-  })
-  assert.equal(
-    (await service.lightning(paymentHash, {bolt11: invoice, max_fee_sats: 10}))
-      .status,
-    'WAITING_FOR_FUNDS'
+  const results = await Promise.all(
+    [...invoices, ...invoices].map(async bolt11 => {
+      const result = await http(handler, 'POST', '/v1/payments', {
+        ...data,
+        bolt11
+      })
+      const hash = decodePayment(bolt11).hash
+      assert.equal(result.result.checking_id, `spark-${hash}`)
+      assert.equal(result.result.payment_hash, hash)
+      return result
+    })
   )
-  assert.equal(sends, 0)
-  available = 100000n
-  assert.equal(
-    (await service.lightning(paymentHash)).status,
-    'LIGHTNING_PAYMENT_SUCCEEDED'
-  )
-  await service.lightning(paymentHash)
-  assert.equal(sends, 1)
-})
-
-test('incoming Lightning funds keep the original intent pending across restart until spendable', async t => {
-  let available = 0n,
-    sends = 0
-  const {service, journal} = await setup(t, {
-    getBalance: async () => ({
-      satsBalance: {
-        available,
-        owned: available,
-        incoming: available ? 0n : 100000n
-      }
-    }),
-    payLightningInvoice: async () => {
-      sends++
-      return {id: 'payment', status: 'LIGHTNING_PAYMENT_SUCCEEDED'}
-    }
-  })
-  assert.equal(
-    (await service.lightning(paymentHash, {bolt11: invoice, max_fee_sats: 10}))
-      .status,
-    'WAITING_FOR_FUNDS'
-  )
-  const restarted = new PaymentService({
-    journal,
-    getWallet: service.getWallet,
-    network: 'MAINNET',
-    fundsWaitMs: 0
-  })
-  assert.equal(
-    (await restarted.lightning(paymentHash)).status,
-    'WAITING_FOR_FUNDS'
-  )
-  assert.equal(sends, 0)
-  available = 100000n
-  assert.equal(
-    (await restarted.lightning(paymentHash)).status,
-    'LIGHTNING_PAYMENT_SUCCEEDED'
-  )
-  assert.equal(sends, 1)
-})
-
-test('a missing-balance grace period waits without blocking other queued operations', async t => {
-  let sends = 0
-  const {service, journal} = await setup(t, {
-    getBalance: async () => ({balance: 0n}),
-    payLightningInvoice: async () => {
-      sends++
-      assert.fail('must not send without funds')
-    }
-  })
-  service.fundsWaitMs = 60000
-  assert.equal(
-    (
-      await service.serial(() =>
-        service.lightning(paymentHash, {bolt11: invoice, max_fee_sats: 10})
-      )
-    ).status,
-    'WAITING_FOR_FUNDS'
-  )
-  assert.equal(
-    await service.serial(async () => 'other-work', 'other-payment'),
-    'other-work'
-  )
-  const record = await journal.get(`ln-${paymentHash}`)
-  record.funds_deadline = Date.now() - 1
-  await journal.put(`ln-${paymentHash}`, record)
-  assert.equal(
-    (await service.lightning(paymentHash)).status,
-    'LIGHTNING_PAYMENT_FAILED'
-  )
-  assert.equal(sends, 0)
+  assert.equal(results.length, 200)
+  assert.equal(sent.size, 100)
+  assert.equal(peak, 8)
 })

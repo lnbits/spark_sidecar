@@ -1,5 +1,6 @@
 import {SparkValidationError} from '@buildonspark/spark-sdk'
 import {decode} from 'light-bolt11-decoder'
+import {setTimeout as delay} from 'node:timers/promises'
 
 export const terminalPaymentStatuses = new Set([
   'LIGHTNING_PAYMENT_SUCCEEDED',
@@ -34,6 +35,21 @@ export function decodePayment(invoice) {
   }
 }
 
+// SDK 0.9.0 LightningSendRequest contains encodedInvoice. The nested invoice
+// object belongs to LightningReceiveRequest and is absent on outgoing requests.
+export function lightningSendPaymentHash(request) {
+  const invoice = request?.encodedInvoice
+  if (typeof invoice !== 'string' || invoice.length > 4096) return null
+  try {
+    const hash = decodePayment(invoice).hash
+    return typeof hash === 'string' && /^[0-9a-f]{64}$/i.test(hash)
+      ? hash.toLowerCase()
+      : null
+  } catch {
+    return null
+  }
+}
+
 export class FundsUnavailableError extends Error {
   constructor(recoverable) {
     super('Waiting for spendable Spark funds')
@@ -51,6 +67,7 @@ const preparationErrors = {
   FEE_LIMIT_EXCEEDED: 'Lightning fee exceeds the limit',
   BALANCE_UNAVAILABLE: 'Spark spendable balance check unavailable',
   FUNDS_UNAVAILABLE: 'Insufficient spendable Spark funds',
+  REQUEST_CANCELLED: 'Payment request disconnected before dispatch',
   WALLET_UNAVAILABLE: 'Spark wallet unavailable before payment dispatch'
 }
 
@@ -90,7 +107,12 @@ export async function requireAvailableFunds(wallet, amountSats) {
   throw new FundsUnavailableError(owned + incoming >= required)
 }
 
-export async function prepareLightningPayment(wallet, params, network) {
+export async function prepareLightningPayment(
+  wallet,
+  params,
+  network,
+  {waitMs = 0, signal} = {}
+) {
   // Any failure here is safe to report as failed: payLightningInvoice has
   // not been called. This includes unavailable quotes.
   let invoice
@@ -133,11 +155,18 @@ export async function prepareLightningPayment(wallet, params, network) {
     error.message = `Spark fee quote (${fee} sats) exceeds the payment fee limit (${params.maxFeeSats} sats)`
     throw error
   }
-  try {
-    await requireAvailableFunds(wallet, amount + fee)
-  } catch (error) {
-    if (error instanceof FundsUnavailableError) throw error
-    throw new PaymentPreparationError('BALANCE_UNAVAILABLE')
+  const deadline = Date.now() + Math.max(0, waitMs)
+  for (;;) {
+    signal?.throwIfAborted()
+    try {
+      await requireAvailableFunds(wallet, amount + fee)
+      return
+    } catch (error) {
+      if (!(error instanceof FundsUnavailableError))
+        throw new PaymentPreparationError('BALANCE_UNAVAILABLE')
+      if (Date.now() >= deadline) throw error
+      await delay(Math.min(250, deadline - Date.now()), undefined, {signal})
+    }
   }
 }
 
@@ -165,11 +194,19 @@ export async function findLightningPayment(
       after,
       types: ['LIGHTNING_SEND']
     })
+    if (
+      !Array.isArray(page?.entities) ||
+      typeof page?.pageInfo?.hasNextPage !== 'boolean'
+    )
+      throw new Error('Invalid Spark history response')
     for (const request of page.entities || []) {
       if (
         request.typename === 'LightningSendRequest' &&
-        request.invoice?.paymentHash?.toLowerCase() === paymentHash
+        typeof request.id === 'string' &&
+        request.id.length > 0 &&
+        lightningSendPaymentHash(request) === paymentHash
       ) {
+        scan.hasMatch = true
         if (match && match.id !== request.id) {
           scan.complete = true
           return null
@@ -179,16 +216,17 @@ export async function findLightningPayment(
     }
     if (!page.pageInfo?.hasNextPage) {
       scan.complete = true
-      // A hash identifies an invoice, not a particular attempt. Without the
-      // dispatch's request ID, an old failed/pending attempt cannot prove the
-      // outcome of a newer send. Only successful settlement of this invoice
-      // is safe to recover from history; otherwise keep the send uncertain.
+      // A hash identifies an invoice, not an attempt. An old failure must not
+      // fail a newer uncertain attempt. Pending requests may still be checked;
+      // only explicit success can settle the invoice through a legacy hash.
       return match &&
-        [
-          'LIGHTNING_PAYMENT_SUCCEEDED',
-          'TRANSFER_COMPLETED',
-          'PREIMAGE_PROVIDED'
-        ].includes(match.status)
+        typeof match.status === 'string' &&
+        (!terminalPaymentStatuses.has(match.status) ||
+          [
+            'LIGHTNING_PAYMENT_SUCCEEDED',
+            'TRANSFER_COMPLETED',
+            'PREIMAGE_PROVIDED'
+          ].includes(match.status))
         ? match
         : null
     }

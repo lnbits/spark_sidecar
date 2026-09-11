@@ -1,8 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import {mkdtemp, rm} from 'node:fs/promises'
 import {IncomingInvoices, receivedFundsAvailable} from './incoming.mjs'
-import {PaymentJournal} from './payment-journal.mjs'
 import {OperationQueue} from './operation-queue.mjs'
 import {refreshBalance} from './lightning.mjs'
 import {SparkWallet} from '@buildonspark/spark-sdk'
@@ -36,17 +34,9 @@ function mockWallet(status = 'AVAILABLE', localStatus = status) {
   }
 }
 async function setup(t, wallet, emit = () => false, concurrency = 8) {
-  const directory = await mkdtemp('/tmp/spark-incoming-test-')
-  const journal = new PaymentJournal(directory)
-  await journal.initialize()
-  const options = {journal, getWallet: async () => wallet, emit, concurrency}
+  const options = {getWallet: async () => wallet, emit, concurrency}
   const incoming = new IncomingInvoices(options)
-  await incoming.initialize()
-  t.after(async () => {
-    await incoming.close()
-    await journal.close()
-    await rm(directory, {recursive: true})
-  })
+  t.after(() => incoming.close())
   return {incoming, options}
 }
 
@@ -78,82 +68,52 @@ test('received Lightning stays pending until its own leaves and local cache are 
   assert.equal(events.length, 1)
 })
 
-test('pending receipts recover after restart and retain credit after leaves are spent', async t => {
+test('a replacement sidecar reconstructs clearing from Spark using only the invoice ID', async t => {
   const wallet = mockWallet('CREATING', 'INCOMING')
-  let emitted = 0
-  const {incoming, options} = await setup(t, wallet, () => {
-    emitted++
-    return true
-  })
-  await incoming.observe(invoice)
+  const {incoming, options} = await setup(t, wallet)
+  assert.equal(
+    (await incoming.observe({id: invoice.id})).status,
+    'WAITING_FOR_FUNDS'
+  )
   await incoming.close()
-  const restarted = new IncomingInvoices(options)
-  await restarted.initialize()
-  assert.equal(restarted.pending.size, 1)
+  const replacement = new IncomingInvoices(options)
+  t.after(() => replacement.close())
+  assert.equal(replacement.pending.size, 0)
   wallet.transfer.leaves[0].leaf.status = 'AVAILABLE'
   wallet.leafManager.leaves.get('leaf').status = 'AVAILABLE'
-  await restarted.retryPending()
-  assert.equal(emitted, 1)
-  await restarted.close()
-  wallet.getTransfer = async () => {
-    throw new Error('spent leaves / outage')
-  }
-  const again = new IncomingInvoices(options)
-  await again.initialize()
-  assert.equal(again.pending.size, 0)
   assert.equal(
-    (await again.observe(invoice)).status,
-    'LIGHTNING_PAYMENT_RECEIVED'
+    (await replacement.observe({id: invoice.id})).status,
+    invoice.status
   )
-  assert.equal(emitted, 1)
-  await again.close()
 })
 
-test('a crash between indexing and recording a receipt recovers the invoice by ID', async t => {
-  let emitted = 0
-  const {incoming, options} = await setup(t, mockWallet(), () => {
-    emitted++
-    return true
-  })
-  const put = options.journal.put.bind(options.journal)
-  options.journal.put = async (key, value) => {
-    if (key.startsWith('receive-'))
-      throw new Error('simulated receipt write failure')
-    return put(key, value)
+test('status checks use fresh Spark data and never emit duplicate settlement notifications', async t => {
+  let calls = 0
+  const wallet = mockWallet()
+  wallet.getLightningReceiveRequest = async () => {
+    calls++
+    return invoice
   }
-  await assert.rejects(incoming.observe(invoice), /write failure/)
-  assert.equal(emitted, 0)
-  options.journal.put = put
-  await incoming.close()
-  const restarted = new IncomingInvoices(options)
-  await restarted.initialize()
-  assert.equal(restarted.pending.size, 1)
-  await restarted.retryPending()
-  assert.equal(emitted, 1)
-  assert.equal(restarted.pending.size, 0)
-  await restarted.close()
+  const {incoming} = await setup(t, wallet, () =>
+    assert.fail('a status read must not emit')
+  )
+  for (let i = 0; i < 2; i++)
+    assert.equal(
+      (await incoming.observe({id: invoice.id}, {notify: false})).status,
+      invoice.status
+    )
+  assert.equal(calls, 2)
+  wallet.getLightningReceiveRequest = async () => {
+    throw new Error('outage')
+  }
+  await assert.rejects(incoming.observe({id: invoice.id}, {notify: false}))
 })
 
-test('a crash before pending-index cleanup does not notify a settled receipt again', async t => {
-  let emitted = 0
-  const {incoming, options} = await setup(t, mockWallet(), () => {
-    emitted++
-    return true
-  })
-  const remove = options.journal.remove.bind(options.journal)
-  options.journal.remove = async () => {
-    throw new Error('simulated index cleanup failure')
-  }
-  await assert.rejects(incoming.observe(invoice), /cleanup failure/)
-  assert.equal(emitted, 1)
-  options.journal.remove = remove
-  await incoming.close()
-  const restarted = new IncomingInvoices(options)
-  await restarted.initialize()
-  await restarted.retryPending()
-  assert.equal(emitted, 1)
-  assert.equal(restarted.pending.size, 0)
-  await restarted.close()
+test('wrong invoice IDs cannot settle a different invoice', async t => {
+  const wallet = mockWallet()
+  wallet.getLightningReceiveRequest = async () => ({...invoice, id: 'other'})
+  const {incoming} = await setup(t, wallet)
+  await assert.rejects(incoming.observe({id: invoice.id}), /ID mismatch/)
 })
 
 test('missing transfer, partial availability, wrong direction and outages never credit early', async t => {
@@ -205,15 +165,14 @@ test('completed receipt recovers after its original leaf is swapped to another o
   wallet.leafManager.leaves.clear()
   wallet.leafManager.leaves.set('replacement', {status: 'AVAILABLE'})
   const restarted = new IncomingInvoices(options)
-  await restarted.initialize()
   t.after(() => restarted.close())
-  await restarted.retryPending()
+  await restarted.observe({id: invoice.id})
   assert.equal(events.length, 1)
   assert.equal(
     (await restarted.observe({id: invoice.id})).status,
     invoice.status
   )
-  await restarted.retryPending()
+  await restarted.observe({id: invoice.id})
   assert.equal(events.length, 1)
 })
 

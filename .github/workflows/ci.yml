@@ -10,7 +10,11 @@ jobs:
     uses: lnbits/lnbits/.github/workflows/lint.yml@dev
 
   payments:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -18,4 +22,7 @@ jobs:
           node-version: '20'
           cache: npm
       - run: npm ci
-      - run: make test-payments test-server
+      - run: node --check server.mjs
+      - run: node payments.test.mjs
+      - run: node incoming.test.mjs
+      - run: node server.test.mjs
