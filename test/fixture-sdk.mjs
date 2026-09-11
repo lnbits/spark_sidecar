@@ -30,12 +30,29 @@ export const SparkWallet = {
     wallet.getTransferFromSsp = async () => ({userRequest: invoice(state())})
     wallet.getTransfer = async () => ({
       id: 'transfer-test',
+      receiverIdentityPublicKey: `02${'1'.repeat(64)}`,
       transferDirection: 'INCOMING',
       status: 'TRANSFER_STATUS_COMPLETED',
-      leaves: [{leaf: {id: 'leaf-test', status: state().operatorStatus}}]
+      leaves: [
+        {
+          leaf: {
+            id: 'leaf-test',
+            status: state().operatorStatus,
+            ownerIdentityPublicKey: state().optimized
+              ? `03${'2'.repeat(64)}`
+              : `02${'1'.repeat(64)}`
+          }
+        }
+      ]
     })
     wallet.getBalance = async () => {
-      wallet.leafManager.leaves.set('leaf-test', {status: state().localStatus})
+      wallet.leafManager.leaves.clear()
+      wallet.leafManager.leaves.set(
+        state().optimized ? 'replacement' : 'leaf-test',
+        {
+          status: state().localStatus
+        }
+      )
       return {balance: 1000000n}
     }
     let event = 0

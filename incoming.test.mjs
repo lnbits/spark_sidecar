@@ -17,6 +17,7 @@ const invoice = {
 function mockWallet(status = 'AVAILABLE', localStatus = status) {
   const transfer = {
     id: 'transfer',
+    receiverIdentityPublicKey: `02${'1'.repeat(64)}`,
     transferDirection: 'INCOMING',
     status: 'TRANSFER_STATUS_COMPLETED',
     leaves: [{leaf: {id: 'leaf', status}}]
@@ -183,6 +184,69 @@ test('optimized leaves prove a completed receipt even after they leave the local
   wallet.leafManager.leaves.clear()
   assert.equal(await receivedFundsAvailable(wallet, invoice), true)
   wallet.transfer.status = 'TRANSFER_STATUS_RECEIVER_KEY_TWEAKED'
+  assert.equal(await receivedFundsAvailable(wallet, invoice), false)
+})
+
+test('completed receipt recovers after its original leaf is swapped to another owner', async t => {
+  const wallet = mockWallet('CREATING', 'INCOMING')
+  const events = []
+  const {incoming, options} = await setup(t, wallet, event => {
+    events.push(event)
+    return true
+  })
+  assert.equal((await incoming.observe(invoice)).status, 'WAITING_FOR_FUNDS')
+  await incoming.close()
+  // Spark returns the leaf's CURRENT owner, even for an old completed transfer.
+  // Optimization spends the original leaf and caches different replacement IDs.
+  wallet.transfer.leaves[0].leaf.status = 'AVAILABLE'
+  wallet.transfer.leaves[0].leaf.ownerIdentityPublicKey = `03${'2'.repeat(64)}`
+  wallet.leafManager.leaves.clear()
+  wallet.leafManager.leaves.set('replacement', {status: 'AVAILABLE'})
+  const restarted = new IncomingInvoices(options)
+  await restarted.initialize()
+  t.after(() => restarted.close())
+  await restarted.retryPending()
+  assert.equal(events.length, 1)
+  assert.equal(
+    (await restarted.observe({id: invoice.id})).status,
+    invoice.status
+  )
+  await restarted.retryPending()
+  assert.equal(events.length, 1)
+})
+
+test('later spending must not make a completed receipt pending again', async () => {
+  for (const localStatus of ['LOCAL_LOCKED', 'OUTGOING', 'SWAP_PENDING']) {
+    const wallet = mockWallet('TRANSFER_LOCKED', localStatus)
+    assert.equal(await receivedFundsAvailable(wallet, invoice), true)
+  }
+  const wallet = mockWallet('TRANSFER_LOCKED')
+  wallet.leafManager.leaves.clear()
+  wallet.transfer.leaves[0].leaf.ownerIdentityPublicKey = `03${'2'.repeat(64)}`
+  assert.equal(await receivedFundsAvailable(wallet, invoice), true)
+  wallet.transfer.status = 'TRANSFER_STATUS_RECEIVER_KEY_TWEAKED'
+  assert.equal(await receivedFundsAvailable(wallet, invoice), false)
+})
+
+test('missing cache entries and unrelated balance alone do not prove clearing', async () => {
+  assert.equal(
+    await receivedFundsAvailable(mockWallet('CREATING', 'AVAILABLE'), invoice),
+    false
+  )
+  const wallet = mockWallet()
+  wallet.leafManager.leaves.clear()
+  for (const owner of [
+    undefined,
+    '',
+    'invalid',
+    wallet.transfer.receiverIdentityPublicKey
+  ]) {
+    wallet.transfer.leaves[0].leaf.ownerIdentityPublicKey = owner
+    assert.equal(await receivedFundsAvailable(wallet, invoice), false)
+  }
+  wallet.transfer.leaves[0].leaf.ownerIdentityPublicKey = `03${'2'.repeat(64)}`
+  // Do not infer ownership history from another leg of a multi-receiver transfer.
+  wallet.transfer.receivers = [{}, {}]
   assert.equal(await receivedFundsAvailable(wallet, invoice), false)
 })
 

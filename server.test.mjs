@@ -5,7 +5,7 @@ import {mkdtemp, writeFile, rename, rm} from 'node:fs/promises'
 import net from 'node:net'
 import test from 'node:test'
 
-test('HTTP status and SSE wait for available receipts, survive restart and work with missed events', async t => {
+async function testReceiptRecovery(t, optimized) {
   const directory = await mkdtemp('/tmp/spark-server-test-')
   const fixturePath = `${directory}/fixture.json`
   const key = 'test-only-key'
@@ -132,7 +132,7 @@ test('HTTP status and SSE wait for available receipts, survive restart and work 
   connection = await stream()
   await save({operatorStatus: 'AVAILABLE'})
   assert.equal((await status()).status, 'WAITING_FOR_FUNDS')
-  await save({localStatus: 'AVAILABLE'})
+  await save({localStatus: 'AVAILABLE', optimized})
   // No new event: the actual server's poller must recover the durable receipt.
   for (let i = 0; i < 100 && !connection.events.length; i++)
     await new Promise(resolve => setTimeout(resolve, 20))
@@ -148,4 +148,9 @@ test('HTTP status and SSE wait for available receipts, survive restart and work 
   })
   await start()
   assert.equal((await status()).status, 'LIGHTNING_PAYMENT_RECEIVED')
-})
+}
+
+for (const optimized of [false, true]) {
+  test(`HTTP status and SSE recover receipts after restart (optimized: ${optimized})`, t =>
+    testReceiptRecovery(t, optimized))
+}

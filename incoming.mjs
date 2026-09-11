@@ -13,6 +13,9 @@ export const receiveSuccessStatuses = new Set([
 const receiptId = id =>
   `receive-${createHash('sha256').update(id).digest('hex')}`
 
+const isIdentityKey = key =>
+  typeof key === 'string' && /^(02|03)[0-9a-f]{64}$/i.test(key)
+
 // A wallet-wide balance cannot prove that a particular invoice has cleared.
 // Check its exact transfer, and retain the proof after its leaves are spent.
 export async function receivedFundsAvailable(wallet, request) {
@@ -26,23 +29,31 @@ export async function receivedFundsAvailable(wallet, request) {
     !transfer.leaves?.length
   )
     return false
-  const available = transfer.leaves.every(
-    ({leaf}) =>
-      leaf && ['AVAILABLE', 'SPLITTED', 'AGGREGATED'].includes(leaf.status)
-  )
-  if (!available) return false
   // Synchronize the SDK's spendable cache before exposing receipt to LNbits.
   await refreshBalance(wallet)
-  // Check the SDK 0.9.0 local leaf registry too: an aggregate balance or
-  // a transfer snapshot alone cannot establish local spendability.
-  // LOCAL_LOCKED/OUTGOING prove a leaf already cleared and was then used.
-  return transfer.leaves.every(
-    ({leaf}) =>
-      ['SPLITTED', 'AGGREGATED'].includes(leaf.status) ||
-      ['AVAILABLE', 'LOCAL_LOCKED', 'OUTGOING'].includes(
-        wallet.leafManager?.leaves?.get(leaf.id)?.status
-      )
-  )
+  return transfer.leaves.every(({leaf}) => {
+    if (!leaf?.id) return false
+    const localStatus = wallet.leafManager?.leaves?.get(leaf.id)?.status
+    if (leaf.status === 'AVAILABLE' && localStatus === 'AVAILABLE') return true
+    // These local spending states are reached only after the leaf was available.
+    // A later spend/swap can already have locked the operator's copy again.
+    if (['LOCAL_LOCKED', 'OUTGOING', 'SWAP_PENDING'].includes(localStatus))
+      return true
+    if (['SPLITTED', 'AGGREGATED'].includes(leaf.status)) return true
+    // getTransfer returns current leaf ownership, not a receipt-time snapshot.
+    // SDK optimization sends the original leaves away and removes their cache
+    // entries. A COMPLETED incoming transfer followed by a different owner
+    // proves that this receipt cleared before the leaf was subsequently spent.
+    // Restrict this inference to single-receiver transfers; other receiver legs
+    // do not establish this wallet's ownership history.
+    return (
+      (transfer.receivers?.length || 0) <= 1 &&
+      isIdentityKey(transfer.receiverIdentityPublicKey) &&
+      isIdentityKey(leaf.ownerIdentityPublicKey) &&
+      leaf.ownerIdentityPublicKey.toLowerCase() !==
+        transfer.receiverIdentityPublicKey.toLowerCase()
+    )
+  })
 }
 
 export class IncomingInvoices {
