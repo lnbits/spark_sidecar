@@ -187,52 +187,6 @@ support for multiple independently running SDK wallets spending the same leaves.
 [![Visit LNbits Shop](https://img.shields.io/badge/Visit-LNbits%20Shop-7C3AED?logo=shopping-cart&logoColor=white&labelColor=5B21B6)](https://shop.lnbits.com/)
 [![Try myLNbits SaaS](https://img.shields.io/badge/Try-myLNbits%20SaaS-2563EB?logo=lightning&logoColor=white&labelColor=1E40AF)](https://my.lnbits.com/login)
 
-## Payment recovery without local storage
-
-The sidecar does not write a payment journal, lock files, or a polling watermark.
-It needs no database, `flock` executable, persistent `/data` mount, or writable
-working directory. Old `SPARK_PAYMENT_STATE_DIR`, `SPARK_ONCHAIN_STATE_DIR`,
-`SPARK_SIDECAR_STATE_PATH`, and `SPARK_STATE_PERSIST_DEBOUNCE_MS` settings are
-ignored. Existing files are left untouched. Temporary queues and stream IDs exist
-only in RAM; they are not authoritative payment records.
-
-New outgoing responses use Spark's request ID as `checking_id`. The existing
-LNbits SparkL2 connector saves and returns this ID without modification, allowing
-a replacement sidecar to call `getLightningSendRequest(id)` directly. Incoming
-checks similarly use Spark's invoice request IDs.
-
-For older outgoing checking IDs and lost submission responses, the sidecar
-searches Spark's `getUserRequests` history by payment hash. Work is bounded to two
-pages per check, continuing across subsequent checks. A hash may refer to several
-attempts, so an ambiguous history or an old failed attempt remains pending;
-it cannot safely prove that a newer attempt failed. New Spark request IDs avoid
-that ambiguity. Missing records and provider outages also stay pending.
-
-Every Lightning submission supplies a stable, network/payment-hash-derived
-`idempotencyKey` to the pinned SDK. Spark stores deduplication state, scoped to the
-wallet identity. The same invoice keeps the same key across process replacement,
-case changes, and fee-limit changes. There are no automatic resubmissions after
-an uncertain SDK response. A terminally failed Spark attempt should be retried
-with a fresh invoice rather than expecting the same key to create a new attempt.
-See [Spark's payment API](https://docs.spark.money/api-reference/wallet/pay-lightning-invoice)
-and its [idempotency interceptor](https://github.com/buildonspark/spark/blob/main/spark/so/grpc/idempotency_interceptor.go).
-
-Restart with the same wallet mnemonic, network, and account number. Mnemonic
-handling and key derivation are unchanged; the sidecar does not save the mnemonic.
-If LNbits supplies it over the API, a funding-source status/balance check must
-perform that handshake again after the sidecar restarts. A payment-ID check alone
-does not resend the mnemonic.
-
-### Upgrading from v0.1.4
-
-Finish outstanding payments on the old version before replacing it. In particular,
-`PREPARING` / `WAITING_FOR_FUNDS` journal entries may represent instructions not yet
-submitted to Spark. The new sidecar will not load or resume those instructions.
-Payments with a lost request ID or multiple attempts under one hash can also need
-reconciliation before upgrading. Keep old files for investigation; this version
-neither deletes them nor treats them as payment authority. Do not run old and new
-sidecars concurrently against the same wallet during the upgrade.
-
 ### Verification
 
 Run `make check` for formatting, static checks, payment tests and localhost HTTP/SSE
