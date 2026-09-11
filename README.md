@@ -163,6 +163,16 @@ while they clear. Status polls resume the original recorded intent; this waiting
 does not occupy a worker between polls. This grace period does not limit how long
 incoming invoices wait for availability.
 
+If a send is rejected with `FEE_LIMIT_EXCEEDED`, the Spark quote exceeds the
+`max_fee_sats` supplied by LNbits. The rejection message shows both amounts.
+In LNbits Admin Settings → Funding, adjust the minimum fee reserve (millisats)
+to cover the quote: `5000` millisats permits a 5-sat fee. LNbits defaults to a
+2000-millisat minimum, whereas Spark's
+[Lightning withdrawal guidance](https://docs.spark.money/wallets/withdraw-to-lightning#fee-recommendations)
+recommends a minimum 5-sat budget. Larger payments or routes may require more.
+The sidecar never raises the supplied limit itself. Older SparkL2 connectors
+ignore `error_message` on failed responses; the sidecar log still shows the reason.
+
 `SPARK_PAY_WAIT_MS` (default `4000`) controls how long a payment POST polls before
 returning its current status; SparkL2 can continue polling pending payments.
 `SPARK_PAY_POLL_MS` defaults to `500`. Keep the POST wait below LNbits' request

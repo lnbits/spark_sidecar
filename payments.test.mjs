@@ -7,7 +7,11 @@ import {Readable} from 'node:stream'
 import {bech32} from '@scure/base'
 import {PaymentJournal} from './payment-journal.mjs'
 import {PaymentService, createPaymentHandler} from './payments.mjs'
-import {SparkValidationError} from '@buildonspark/spark-sdk'
+import {
+  SparkValidationError,
+  SparkWallet,
+  Network
+} from '@buildonspark/spark-sdk'
 import {
   decodePayment,
   prepareLightningPayment,
@@ -17,6 +21,70 @@ import {
 const invoice =
   'lnbc20u1p3y0x3hpp5743k2g0fsqqxj7n8qzuhns5gmkk4djeejk3wkp64ppevgekvc0jsdqcve5kzar2v9nr5gpqd4hkuetesp5ez2g297jduwc20t6lmqlsg3man0vf2jfd8ar9fh8fhn2g8yttfkqxqy9gcqcqzys9qrsgqrzjqtx3k77yrrav9hye7zar2rtqlfkytl094dsp0ms5majzth6gt7ca6uhdkxl983uywgqqqqlgqqqvx5qqjqrzjqd98kxkpyw0l9tyy8r8q57k7zpy9zjmh6sez752wj6gcumqnj3yxzhdsmg6qq56utgqqqqqqqqqqqeqqjq7jd56882gtxhrjm03c93aacyfy306m4fq0tskf83c0nmet8zc2lxyyg3saz8x6vwcp26xnrlagf9semau3qm2glysp7sv95693fphvsp54l567'
 const paymentHash = decodePayment(invoice).hash
+
+test('preflight and SDK dispatch enforce the same fee limit for either invoice case', async () => {
+  const wallet = Object.create(SparkWallet.prototype)
+  wallet.config = {getNetwork: () => Network.MAINNET}
+  wallet.getSspClient = () => ({
+    getLightningSendFeeEstimate: async encodedInvoice => {
+      assert.equal(encodedInvoice, invoice)
+      return {feeEstimate: {originalUnit: 'SATOSHI', originalValue: 5}}
+    }
+  })
+  wallet.getBalance = async () => ({balance: 1000000n})
+  wallet.getCachedBalance = wallet.getBalance
+  wallet.leafManager = {
+    // Stop at leaf selection: the actual SDK's normalization and fee path run,
+    // but no transfer callback, signing, or network request is permitted.
+    selectLeavesAndExecute: async amounts => {
+      assert.deepEqual(amounts, [2005])
+      return {id: 'fixture-send', status: 'LIGHTNING_PAYMENT_SUCCEEDED'}
+    }
+  }
+  for (const encoded of [invoice, invoice.toUpperCase()]) {
+    const params = {invoice: encoded, maxFeeSats: 2}
+    await assert.rejects(prepareLightningPayment(wallet, params, 'MAINNET'), {
+      code: 'FEE_LIMIT_EXCEEDED'
+    })
+    await assert.rejects(wallet.payLightningInvoice(params), {
+      initialMessage: 'maxFeeSats does not cover fee estimate'
+    })
+    params.maxFeeSats = 5
+    await prepareLightningPayment(wallet, params, 'MAINNET')
+    assert.equal(
+      (await wallet.payLightningInvoice(params)).status,
+      'LIGHTNING_PAYMENT_SUCCEEDED'
+    )
+  }
+})
+
+test('preflight failures persist safe reasons without exposing SDK error contents', async t => {
+  const secret = 'MOCK_MNEMONIC_MUST_NOT_LEAK'
+  const logs = []
+  t.mock.method(console, 'warn', message => logs.push(message))
+  for (const [method, code] of [
+    ['getLightningSendFeeEstimate', 'FEE_QUOTE_UNAVAILABLE'],
+    ['getBalance', 'BALANCE_UNAVAILABLE']
+  ]) {
+    const {service, journal} = await setup(t, {
+      [method]: async () => {
+        throw new Error(secret)
+      },
+      payLightningInvoice: async () => assert.fail('must not dispatch')
+    })
+    const result = await service.lightning(paymentHash, {
+      bolt11: invoice,
+      max_fee_sats: 2
+    })
+    assert.equal(result.status, 'LIGHTNING_PAYMENT_FAILED')
+    assert.equal(result.failure_code, code)
+    const saved = await journal.get(`ln-${paymentHash}`)
+    assert.equal(saved.not_sent, true)
+    assert.equal(saved.failure_code, code)
+    assert.equal((await service.lightning(paymentHash)).failure_code, code)
+    assert(!JSON.stringify([result, saved, logs]).includes(secret))
+  }
+})
 
 test('concurrent HTTP payments retain independent queues and suppress duplicate sends', async t => {
   const directory = await mkdtemp('/tmp/spark-lightning-volume-')
@@ -255,6 +323,17 @@ for (const reason of ['fee', 'balance', 'network', 'invoice']) {
       max_fee_sats: 10
     })
     assert.equal(result.status, 'LIGHTNING_PAYMENT_FAILED')
+    if (reason === 'fee') {
+      assert.equal(result.failure_code, 'FEE_LIMIT_EXCEEDED')
+      assert.equal(
+        result.error_message,
+        'Spark fee quote (11 sats) exceeds the payment fee limit (10 sats)'
+      )
+      assert.equal(
+        (await service.lightning(paymentHash)).error_message,
+        result.error_message
+      )
+    }
     assert.equal(
       (await service.lightning(paymentHash)).status,
       'LIGHTNING_PAYMENT_FAILED'

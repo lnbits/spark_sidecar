@@ -7,7 +7,8 @@ import {
   findLightningPayment,
   terminalPaymentStatuses,
   decodePayment,
-  FundsUnavailableError
+  FundsUnavailableError,
+  PaymentPreparationError
 } from './lightning.mjs'
 
 const hash = value =>
@@ -141,13 +142,33 @@ export class PaymentService {
             : 'LIGHTNING_PAYMENT_FAILED'
           intent.not_sent = !waiting
           intent.fee_msat = waiting ? null : 0
+          if (!waiting) {
+            const failure =
+              error instanceof PaymentPreparationError
+                ? error
+                : new PaymentPreparationError(
+                    error instanceof FundsUnavailableError
+                      ? 'FUNDS_UNAVAILABLE'
+                      : 'WALLET_UNAVAILABLE'
+                  )
+            intent.failure_code = failure.code
+            intent.error_message = failure.message
+            // Locally constructed reasons only; never log raw SDK exceptions.
+            console.warn(
+              `Lightning payment rejected before dispatch: ${failure.code}: ${failure.message}`
+            )
+          }
           await this.journal.put(id, intent)
           return {
             checking_id: hashValue,
             payment_hash: hashValue,
             status: intent.status,
             fee_msat: intent.fee_msat,
-            preimage: null
+            preimage: null,
+            ...(intent.failure_code && {
+              failure_code: intent.failure_code,
+              error_message: intent.error_message
+            })
           }
         }
         intent.status = 'UNKNOWN'
@@ -185,7 +206,11 @@ export class PaymentService {
       payment_hash: hashValue,
       status: record.status,
       fee_msat: record.fee_msat,
-      preimage: record.preimage
+      preimage: record.preimage,
+      ...(record.failure_code && {
+        failure_code: record.failure_code,
+        error_message: record.error_message
+      })
     }
   }
 

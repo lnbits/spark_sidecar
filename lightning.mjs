@@ -41,6 +41,26 @@ export class FundsUnavailableError extends Error {
   }
 }
 
+const preparationErrors = {
+  INVALID_INVOICE: 'Invalid Lightning invoice',
+  NETWORK_MISMATCH: 'Invoice network does not match wallet network',
+  INVALID_AMOUNT: 'Invalid Lightning amount',
+  AMOUNT_OVERRIDE: 'Only amountless invoices accept amount_sats',
+  FEE_QUOTE_UNAVAILABLE: 'Spark Lightning fee quote unavailable',
+  INVALID_FEE_QUOTE: 'Spark returned an invalid Lightning fee quote',
+  FEE_LIMIT_EXCEEDED: 'Lightning fee exceeds the limit',
+  BALANCE_UNAVAILABLE: 'Spark spendable balance check unavailable',
+  FUNDS_UNAVAILABLE: 'Insufficient spendable Spark funds',
+  WALLET_UNAVAILABLE: 'Spark wallet unavailable before payment dispatch'
+}
+
+export class PaymentPreparationError extends Error {
+  constructor(code) {
+    super(preparationErrors[code])
+    this.code = code
+  }
+}
+
 const balanceRefreshes = new WeakMap()
 
 export async function refreshBalance(wallet) {
@@ -73,7 +93,12 @@ export async function requireAvailableFunds(wallet, amountSats) {
 export async function prepareLightningPayment(wallet, params, network) {
   // Any failure here is safe to report as failed: payLightningInvoice has
   // not been called. This includes unavailable quotes.
-  const invoice = decodePayment(params.invoice)
+  let invoice
+  try {
+    invoice = decodePayment(params.invoice)
+  } catch {
+    throw new PaymentPreparationError('INVALID_INVOICE')
+  }
   const expectedNetwork = {
     MAINNET: 'bc',
     TESTNET: 'tb',
@@ -82,21 +107,38 @@ export async function prepareLightningPayment(wallet, params, network) {
     LOCAL: 'bcrt'
   }[network]
   if (expectedNetwork && invoice.network !== expectedNetwork)
-    throw new Error('Invoice network does not match wallet network')
+    throw new PaymentPreparationError('NETWORK_MISMATCH')
   const amount = invoice.amountMsat
     ? Math.ceil(Number(invoice.amountMsat) / 1000)
     : params.amountSatsToSend
   if (!Number.isSafeInteger(amount) || amount <= 0)
-    throw new Error('Invalid Lightning amount')
+    throw new PaymentPreparationError('INVALID_AMOUNT')
   if (invoice.amountMsat && params.amountSatsToSend !== undefined)
-    throw new Error('Only amountless invoices accept amount_sats')
-  const fee = await wallet.getLightningSendFeeEstimate({
-    encodedInvoice: params.invoice,
-    amountSats: params.amountSatsToSend
-  })
-  if (!Number.isSafeInteger(fee) || fee < 0 || fee > params.maxFeeSats)
-    throw new Error('Lightning fee exceeds the limit')
-  await requireAvailableFunds(wallet, amount + fee)
+    throw new PaymentPreparationError('AMOUNT_OVERRIDE')
+  let fee
+  try {
+    fee = await wallet.getLightningSendFeeEstimate({
+      // SDK 0.9.0 payLightningInvoice normalizes before requesting its quote.
+      // The standalone quote method does not; preserve that behavior here too.
+      encodedInvoice: params.invoice.toLowerCase(),
+      amountSats: params.amountSatsToSend
+    })
+  } catch {
+    throw new PaymentPreparationError('FEE_QUOTE_UNAVAILABLE')
+  }
+  if (!Number.isSafeInteger(fee) || fee < 0)
+    throw new PaymentPreparationError('INVALID_FEE_QUOTE')
+  if (fee > params.maxFeeSats) {
+    const error = new PaymentPreparationError('FEE_LIMIT_EXCEEDED')
+    error.message = `Spark fee quote (${fee} sats) exceeds the payment fee limit (${params.maxFeeSats} sats)`
+    throw error
+  }
+  try {
+    await requireAvailableFunds(wallet, amount + fee)
+  } catch (error) {
+    if (error instanceof FundsUnavailableError) throw error
+    throw new PaymentPreparationError('BALANCE_UNAVAILABLE')
+  }
 }
 
 export async function sendLightningPayment(wallet, params) {
