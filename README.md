@@ -101,7 +101,8 @@ cleared. Both invoice status lookups and stream notifications check the invoice'
 own incoming transfer and its leaves. A Lightning success status alone is not
 enough: uncleared receipts return `WAITING_FOR_FUNDS`, which SparkL2 maps to pending.
 The check requires a completed transfer and available leaves registered in the
-SDK's local cache. Completed splits/aggregations also prove prior availability.
+SDK's local cache. Later spending, completed splits/aggregations, or a subsequent
+ownership change on a single-receiver transfer also prove prior availability.
 The sidecar persists that proof so spending the leaves later cannot reverse an
 invoice's paid status.
 
@@ -111,6 +112,14 @@ survive restart; the discovery watermark advances only after they are recorded.
 Startup loads a separate durable pending index, without scanning settled receipts.
 The availability check reads the pinned SDK's internal leaf registry; review
 `incoming.mjs` when upgrading the SDK.
+
+The stream has no LNbits acknowledgement protocol: `notified` records that Node
+accepted an event for writing, not that LNbits committed settlement. A crash in
+between can lose a notification; invoice status lookups still return its durable
+paid status. Blind replay is not enabled because the current LNbits consumer
+forwards repeated notifications to extension listeners even for settled invoices.
+Reliable replay requires consumer deduplication and an acknowledgement after
+settlement is committed.
 
 Example:
 
@@ -184,9 +193,19 @@ Lightning send intents and request IDs are persisted before responding. An
 ambiguous result is retained and never automatically resent.
 
 Run one writer. Back up its journal with the LNbits databases. Do not delete
-operation files to retry payments. Graceful shutdown removes `writer.lock`; after
-a crash verify that the previous writer has stopped before removing a stale
-lock. Ensure your process supervisor forwards shutdown signals to the sidecar;
+operation files to retry payments. On Linux, a kernel `flock` is held for the
+writer's lifetime and released automatically on crashes, including `SIGKILL`.
+Linux requires the `flock` command from util-linux; Docker and Nix include it.
+The permanent `writer.flock` inode must never be removed. `writer.lock` is a hard
+link to it, preventing older sidecars from starting against the active journal;
+a leftover link from this implementation is recovered automatically. Use local
+storage supporting file locks and hard links.
+
+An old PID-only `writer.lock` is deliberately not reclaimed automatically: its
+PID cannot establish ownership across containers. For that one-time upgrade
+case, verify the previous writer has stopped before removing the old marker.
+Non-Linux platforms retain the earlier exclusive-file lock and manual recovery.
+Ensure your process supervisor forwards shutdown signals to the sidecar;
 a wrapper that backgrounds Node and then replaces itself with LNbits does not do
 this. Lightning requests with missing external IDs are looked up in Spark history
 by payment hash; only an unambiguous successful settlement can resolve them.
@@ -199,8 +218,10 @@ successful or uncertain sends are never dispatched again.
 The SDK is pinned to `0.9.0`; review the receive availability check in
 `incoming.mjs` before upgrading.
 
-Run `make test-payments` for receipt availability, durability, concurrency and
-duplicate-send tests. Run `make test-server` for localhost HTTP/SSE integration
-tests using a mocked SDK (no Spark network access or funds).
+Run `make check` for formatting, static checks, payment/journal tests and localhost
+HTTP/SSE integration tests. CI also runs both Node test targets explicitly.
+`make test-payments` covers crash recovery, availability, durability, concurrency
+and duplicate sends; `make test-server` uses a mocked SDK (no Spark network access
+or funds).
 Test with the exact deployed Spark SDK and network before using real funds.
 The invoice decoder is declared directly and is already a dependency of the Spark SDK.

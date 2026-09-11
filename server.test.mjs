@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict'
 import {spawn} from 'node:child_process'
 import {once} from 'node:events'
-import {mkdtemp, writeFile, rename, rm} from 'node:fs/promises'
+import {
+  mkdtemp,
+  readFile,
+  readdir,
+  writeFile,
+  rename,
+  rm
+} from 'node:fs/promises'
 import net from 'node:net'
 import test from 'node:test'
 
@@ -9,6 +16,7 @@ async function testReceiptRecovery(t, optimized) {
   const directory = await mkdtemp('/tmp/spark-server-test-')
   const fixturePath = `${directory}/fixture.json`
   const key = 'test-only-key'
+  const secret = 'LEAKCANARY'
   let legacyLocation = true
   let data = {
     operatorStatus: 'CREATING',
@@ -34,6 +42,7 @@ async function testReceiptRecovery(t, optimized) {
   t.after(async () => {
     await stop()
     await rm(directory, {recursive: true})
+    assert(!logs.includes(secret), 'Mnemonic reached process logs')
   })
   const start = async () => {
     const socket = net.createServer()
@@ -49,7 +58,7 @@ async function testReceiptRecovery(t, optimized) {
         cwd: import.meta.dirname || new URL('.', import.meta.url).pathname,
         env: {
           ...process.env,
-          SPARK_MNEMONIC: 'mock-only',
+          SPARK_MNEMONIC: secret,
           SPARK_SIDECAR_PORT: String(port),
           SPARK_SIDECAR_HOST: '127.0.0.1',
           SPARK_SIDECAR_API_KEY: key,
@@ -118,6 +127,42 @@ async function testReceiptRecovery(t, optimized) {
     }
   }
   await start()
+  await t.test(
+    'request parsing and SDK failures do not expose mnemonic text',
+    async () => {
+      const headers = {'x-api-key': key, 'content-type': 'application/json'}
+      const malformed = await fetch(`${base}/v1/mnemonic`, {
+        method: 'POST',
+        headers,
+        body: secret
+      })
+      assert.equal(malformed.status, 500)
+      assert(
+        !(await malformed.text()).includes(secret),
+        'Parser echoed secret input'
+      )
+      const supplied = await fetch(`${base}/v1/mnemonic`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({mnemonic: secret})
+      })
+      assert.deepEqual(await supplied.json(), {status: 'already_set'})
+      await save({balanceError: true})
+      try {
+        const failed = await fetch(`${base}/v1/balance`, {
+          method: 'POST',
+          headers
+        })
+        assert.equal(failed.status, 500)
+        assert(
+          !(await failed.text()).includes(secret),
+          'SDK error exposed mnemonic'
+        )
+      } finally {
+        await save({balanceError: false})
+      }
+    }
+  )
   await save({updatedAt: new Date().toISOString()})
   let connection = await stream()
   // The event path must not trust success status before AVAILABLE either.
@@ -148,6 +193,18 @@ async function testReceiptRecovery(t, optimized) {
   })
   await start()
   assert.equal((await status()).status, 'LIGHTNING_PAYMENT_RECEIVED')
+  await stop()
+  for (const filename of await readdir(`${directory}/journal`, {
+    recursive: true
+  })) {
+    if (!filename.endsWith('.json')) continue
+    assert(
+      !(await readFile(`${directory}/journal/${filename}`, 'utf8')).includes(
+        secret
+      ),
+      'Mnemonic reached the payment journal'
+    )
+  }
 }
 
 for (const optimized of [false, true]) {

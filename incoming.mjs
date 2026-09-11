@@ -46,6 +46,8 @@ export async function receivedFundsAvailable(wallet, request) {
     // proves that this receipt cleared before the leaf was subsequently spent.
     // Restrict this inference to single-receiver transfers; other receiver legs
     // do not establish this wallet's ownership history.
+    // Pinned SDK 0.9.0 maps protobuf receivers to WalletTransfer.receivers;
+    // undefined means the protobuf list was empty (legacy transfer).
     return (
       (transfer.receivers?.length || 0) <= 1 &&
       isIdentityKey(transfer.receiverIdentityPublicKey) &&
@@ -155,8 +157,8 @@ export class IncomingInvoices {
     }
     await Promise.all(
       ids.map(id =>
-        this.observe({id}).catch(error => {
-          console.error('Error retrying incoming invoice:', error)
+        this.observe({id}).catch(() => {
+          console.error('Error retrying incoming invoice')
         })
       )
     )

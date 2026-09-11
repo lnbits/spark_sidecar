@@ -46,6 +46,13 @@ export const SparkWallet = {
       ]
     })
     wallet.getBalance = async () => {
+      if (state().balanceError) {
+        const error = new Error(
+          `Fixture SDK error: ${process.env.SPARK_MNEMONIC}`
+        )
+        error.context = {mnemonic: process.env.SPARK_MNEMONIC}
+        throw error
+      }
       wallet.leafManager.leaves.clear()
       wallet.leafManager.leaves.set(
         state().optimized ? 'replacement' : 'leaf-test',

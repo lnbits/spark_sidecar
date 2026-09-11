@@ -5,7 +5,7 @@ all: format check
 
 format: prettier
 
-check: pyright checkprettier test-payments
+check: pyright checkprettier test-payments test-server
 
 
 prettier:
@@ -33,6 +33,7 @@ mypy:
 .PHONY: test-payments
 test-payments:
 	node --check server.mjs
+	node payment-journal.test.mjs
 	node payments.test.mjs
 	node incoming.test.mjs
 

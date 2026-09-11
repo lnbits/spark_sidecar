@@ -94,8 +94,8 @@ function loadState() {
     if (Number.isFinite(parsed?.lastSeenUpdatedAtMs)) {
       lastSeenUpdatedAtMs = parsed.lastSeenUpdatedAtMs
     }
-  } catch (error) {
-    console.error('Error loading Spark sidecar state:', error)
+  } catch {
+    console.error('Error loading Spark sidecar state')
   }
 }
 
@@ -106,8 +106,8 @@ async function persistState() {
       JSON.stringify({lastSeenUpdatedAtMs}),
       'utf8'
     )
-  } catch (error) {
-    console.error('Error persisting Spark sidecar state:', error)
+  } catch {
+    console.error('Error persisting Spark sidecar state')
   }
 }
 
@@ -199,8 +199,8 @@ async function shutdown() {
         wallet.cleanup()
       }
     }
-  } catch (error) {
-    console.error('Error during Spark sidecar shutdown:', error)
+  } catch {
+    console.error('Error during Spark sidecar shutdown')
   } finally {
     process.exit(0)
   }
@@ -349,8 +349,8 @@ async function pollInvoiceUpdates() {
         throw new Error('Invalid invoice pagination')
       invoiceScan.cursor = info.endCursor
     }
-  } catch (error) {
-    console.error('Error polling lightning invoices:', error)
+  } catch {
+    console.error('Error polling lightning invoices')
   } finally {
     invoicePollInFlight = false
   }
@@ -374,8 +374,8 @@ async function handleTransferLookup(transferId) {
     }
     if (!receiveSuccessStatuses.has(userRequest.status)) return
     await incomingInvoices.observe(userRequest)
-  } catch (error) {
-    console.error('Error handling transfer event:', error)
+  } catch {
+    console.error('Error handling transfer event')
   }
 }
 
@@ -596,10 +596,11 @@ server = http.createServer(async (req, res) => {
     }
 
     return sendJson(res, 404, {error: 'Not found'})
-  } catch (error) {
-    console.error('Error handling request:', error)
-    const message = error instanceof Error ? error.message : String(error)
-    return sendJson(res, 500, {error: message})
+  } catch {
+    // Parser and SDK errors may contain request bodies or wallet secrets.
+    // Never expose their messages, nested context, or stacks to logs/clients.
+    console.error('Error handling sidecar request')
+    return sendJson(res, 500, {error: 'Spark sidecar request failed'})
   }
 })
 

@@ -31,7 +31,8 @@
 
         runSidecar = pkgs.writeShellApplication {
           name = "spark-sidecar";
-          runtimeInputs = [ pkgs.nodejs_20 ];
+          runtimeInputs = [ pkgs.nodejs_20 ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.util-linux ];
           text = ''
             export NODE_PATH=${package}/lib/node_modules/${pname}/node_modules
             exec ${pkgs.nodejs_20}/bin/node ${package}/lib/node_modules/${pname}/server.mjs
@@ -42,7 +43,8 @@
         packages.default = package;
         apps.default = flake-utils.lib.mkApp { drv = runSidecar; };
         devShells.default = pkgs.mkShell {
-          packages = [ pkgs.nodejs_20 pkgs.nodePackages.npm ];
+          packages = [ pkgs.nodejs_20 pkgs.nodePackages.npm ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.util-linux ];
         };
       });
 }

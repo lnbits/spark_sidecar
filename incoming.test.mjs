@@ -5,6 +5,8 @@ import {IncomingInvoices, receivedFundsAvailable} from './incoming.mjs'
 import {PaymentJournal} from './payment-journal.mjs'
 import {OperationQueue} from './operation-queue.mjs'
 import {refreshBalance} from './lightning.mjs'
+import {SparkWallet} from '@buildonspark/spark-sdk'
+import {SparkProto} from '@buildonspark/spark-sdk/types'
 
 const invoice = {
   id: 'invoice',
@@ -247,6 +249,78 @@ test('missing cache entries and unrelated balance alone do not prove clearing', 
   wallet.transfer.leaves[0].leaf.ownerIdentityPublicKey = `03${'2'.repeat(64)}`
   // Do not infer ownership history from another leg of a multi-receiver transfer.
   wallet.transfer.receivers = [{}, {}]
+  assert.equal(await receivedFundsAvailable(wallet, invoice), false)
+})
+
+test('SDK 0.9.0 getTransfer preserves receiver legs and blocks multi-receiver ownership inference', async () => {
+  const ownKey = Buffer.from(`02${'1'.repeat(64)}`, 'hex')
+  const otherKey = Buffer.from(`03${'2'.repeat(64)}`, 'hex')
+  const laterOwner = Buffer.from(`02${'3'.repeat(64)}`, 'hex')
+  const receiver = (id, identityPublicKey) => ({
+    id,
+    identityPublicKey,
+    amountSats: 100,
+    status: SparkProto.TransferReceiverStatus.TRANSFER_RECEIVER_STATUS_COMPLETED
+  })
+  const proto = SparkProto.Transfer.fromPartial({
+    id: 'transfer',
+    status: SparkProto.TransferStatus.TRANSFER_STATUS_COMPLETED,
+    receiverIdentityPublicKey: ownKey,
+    totalValue: 100,
+    leaves: [
+      {
+        leaf: {
+          id: 'leaf',
+          status: 'AVAILABLE',
+          ownerIdentityPublicKey: laterOwner
+        }
+      }
+    ]
+  })
+  // Use the actual SDK getTransfer + mapping code, without initializing a wallet,
+  // keys, connections or a signer. Only the RPC response and identity are fixtures.
+  const wallet = Object.create(SparkWallet.prototype)
+  wallet.config = {signer: {getIdentityPublicKey: async () => ownKey}}
+  wallet.transferService = {queryTransfer: async () => proto}
+  wallet.leafManager = {leaves: new Map()}
+  wallet.getBalance = async () => ({balance: 100n})
+
+  // Legacy transfers: the protobuf defaults to [], which the SDK maps to undefined.
+  assert.deepEqual(proto.receivers, [])
+  assert.equal((await wallet.getTransfer('transfer')).receivers, undefined)
+  assert.equal(await receivedFundsAvailable(wallet, invoice), true)
+
+  proto.receivers = [receiver('own', ownKey)]
+  const single = await wallet.getTransfer('transfer')
+  assert.deepEqual(single.receivers, [
+    {
+      identityPublicKey: ownKey.toString('hex'),
+      amountSats: 100,
+      status: 'TRANSFER_RECEIVER_STATUS_COMPLETED'
+    }
+  ])
+  assert.equal(await receivedFundsAvailable(wallet, invoice), true)
+
+  // This wallet is the secondary receiver. Its own leaf is locally available;
+  // another receiver's subsequently spent leaf must not count as its receipt.
+  proto.receiverIdentityPublicKey = otherKey
+  proto.receivers = [receiver('other', otherKey), receiver('own', ownKey)]
+  proto.totalValue = 200
+  proto.leaves.push(
+    SparkProto.TransferLeaf.fromPartial({
+      transferReceiverId: 'own',
+      leaf: {
+        id: 'own-leaf',
+        status: 'AVAILABLE',
+        ownerIdentityPublicKey: ownKey
+      }
+    })
+  )
+  wallet.leafManager.leaves.set('own-leaf', {status: 'AVAILABLE'})
+  const multi = await wallet.getTransfer('transfer')
+  assert.equal(multi.transferDirection, 'INCOMING')
+  assert.equal(multi.receivers.length, 2)
+  assert.equal(multi.receivers[1].identityPublicKey, ownKey.toString('hex'))
   assert.equal(await receivedFundsAvailable(wallet, invoice), false)
 })
 
