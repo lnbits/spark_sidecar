@@ -5,7 +5,7 @@ all: format check
 
 format: prettier
 
-check: pyright checkprettier
+check: pyright checkprettier test-payments test-server
 
 
 prettier:
@@ -29,3 +29,14 @@ checkbundle:
 
 mypy:
 	echo "Does not apply, skipping."
+
+.PHONY: test-payments
+test-payments:
+	node --check server.mjs
+	node payment-journal.test.mjs
+	node payments.test.mjs
+	node incoming.test.mjs
+
+.PHONY: test-server
+test-server:
+	node server.test.mjs
