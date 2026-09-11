@@ -5,26 +5,38 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  chmod,
   writeFile,
   rename,
   rm
 } from 'node:fs/promises'
 import net from 'node:net'
 import test from 'node:test'
+import {tmpdir} from 'node:os'
+import path from 'node:path'
+import {fileURLToPath} from 'node:url'
+import {invoice as sendInvoice} from './test/invoice.mjs'
+import {decodePayment} from './lightning.mjs'
 
 async function testReceiptRecovery(t, optimized) {
-  const directory = await mkdtemp('/tmp/spark-server-test-')
+  const directory = await mkdtemp(path.join(tmpdir(), 'spark-server-test-'))
   const fixturePath = `${directory}/fixture.json`
   const key = 'test-only-key'
   const secret = 'LEAKCANARY'
-  let legacyLocation = true
+  const workingDirectories = []
   let data = {
     operatorStatus: 'CREATING',
     localStatus: 'INCOMING',
-    updatedAt: new Date().toISOString()
+    updatedAt: new Date().toISOString(),
+    sendHash: decodePayment(sendInvoice).hash
   }
   const save = async updates => {
-    data = {...data, ...updates}
+    data = {
+      ...JSON.parse(
+        await readFile(fixturePath, 'utf8').catch(() => JSON.stringify(data))
+      ),
+      ...updates
+    }
     await writeFile(`${fixturePath}.tmp`, JSON.stringify(data))
     await rename(`${fixturePath}.tmp`, fixturePath)
   }
@@ -33,14 +45,15 @@ async function testReceiptRecovery(t, optimized) {
     exited,
     base,
     logs = ''
-  const stop = async () => {
+  const stop = async (signal = 'SIGTERM') => {
     if (!child) return
-    child.kill('SIGTERM')
+    child.kill(signal)
     await exited
     child = null
   }
   t.after(async () => {
     await stop()
+    for (const cwd of workingDirectories) await chmod(cwd, 0o700)
     await rm(directory, {recursive: true})
     assert(!logs.includes(secret), 'Mnemonic reached process logs')
   })
@@ -51,11 +64,18 @@ async function testReceiptRecovery(t, optimized) {
     const port = socket.address().port
     await new Promise(resolve => socket.close(resolve))
     base = `http://127.0.0.1:${port}`
+    const cwd = await mkdtemp(path.join(directory, 'empty-cwd-'))
+    workingDirectories.push(cwd)
+    if (process.platform !== 'win32') await chmod(cwd, 0o555)
     child = spawn(
       process.execPath,
-      ['--loader', './test/fixture-loader.mjs', 'server.mjs'],
+      [
+        '--loader',
+        new URL('./test/fixture-loader.mjs', import.meta.url).href,
+        fileURLToPath(new URL('./server.mjs', import.meta.url))
+      ],
       {
-        cwd: import.meta.dirname || new URL('.', import.meta.url).pathname,
+        cwd,
         env: {
           ...process.env,
           SPARK_MNEMONIC: secret,
@@ -63,9 +83,10 @@ async function testReceiptRecovery(t, optimized) {
           SPARK_SIDECAR_HOST: '127.0.0.1',
           SPARK_SIDECAR_API_KEY: key,
           SPARK_ONCHAIN_ENABLED: 'false',
-          SPARK_PAYMENT_STATE_DIR: legacyLocation ? '' : `${directory}/journal`,
-          SPARK_ONCHAIN_STATE_DIR: legacyLocation ? `${directory}/journal` : '',
-          SPARK_SIDECAR_STATE_PATH: `${directory}/state.json`,
+          SPARK_PAYMENT_STATE_DIR: `${cwd}/must-not-create-journal`,
+          SPARK_ONCHAIN_STATE_DIR: `${cwd}/must-not-create-onchain`,
+          SPARK_SIDECAR_STATE_PATH: `${cwd}/must-not-create-state.json`,
+          SPARK_PAY_WAIT_MS: '0',
           SPARK_TEST_STATE: fixturePath,
           SPARK_INVOICE_POLL_MS: '40',
           SPARK_STREAM_HEARTBEAT_MS: '0',
@@ -81,7 +102,8 @@ async function testReceiptRecovery(t, optimized) {
       logs += chunk
     })
     exited = once(child, 'exit')
-    for (let i = 0; i < 100; i++) {
+    const deadline = Date.now() + 30_000
+    while (Date.now() < deadline) {
       try {
         if ((await fetch(`${base}/health`, {headers: {'x-api-key': key}})).ok)
           return
@@ -172,13 +194,14 @@ async function testReceiptRecovery(t, optimized) {
   assert.equal(connection.events.length, 0)
   await connection.close()
   await stop()
-  legacyLocation = false
   await start()
   connection = await stream()
   await save({operatorStatus: 'AVAILABLE'})
   assert.equal((await status()).status, 'WAITING_FOR_FUNDS')
   await save({localStatus: 'AVAILABLE', optimized})
-  // No new event: the actual server's poller must recover the durable receipt.
+  // The GET above recovered this old receipt directly from Spark. Streaming
+  // must also find new updates from Spark without a disk watermark.
+  await save({updatedAt: new Date().toISOString()})
   for (let i = 0; i < 100 && !connection.events.length; i++)
     await new Promise(resolve => setTimeout(resolve, 20))
   assert.equal(connection.events.length, 1, logs)
@@ -189,25 +212,60 @@ async function testReceiptRecovery(t, optimized) {
   await save({
     operatorStatus: 'TRANSFER_LOCKED',
     localStatus: 'OUTGOING',
-    outage: true
+    outage: false
   })
   await start()
   assert.equal((await status()).status, 'LIGHTNING_PAYMENT_RECEIVED')
   await stop()
-  for (const filename of await readdir(`${directory}/journal`, {
-    recursive: true
-  })) {
-    if (!filename.endsWith('.json')) continue
-    assert(
-      !(await readFile(`${directory}/journal/${filename}`, 'utf8')).includes(
-        secret
-      ),
-      'Mnemonic reached the payment journal'
-    )
-  }
+  // Outgoing checks also survive a fresh process and working directory.
+  await start()
+  const sent = await (
+    await fetch(`${base}/v1/payments`, {
+      method: 'POST',
+      headers: {'x-api-key': key, 'content-type': 'application/json'},
+      body: JSON.stringify({bolt11: sendInvoice, max_fee_sats: 5})
+    })
+  ).json()
+  assert.equal(sent.checking_id, 'spark-send-request')
+  assert.equal(sent.status, 'CREATED')
+  await stop('SIGKILL')
+  const provider = JSON.parse(await readFile(fixturePath, 'utf8'))
+  await save({
+    sendRequest: {
+      ...provider.sendRequest,
+      status: 'LIGHTNING_PAYMENT_SUCCEEDED',
+      paymentPreimage: 'send-proof'
+    }
+  })
+  await start()
+  const outgoing = async id =>
+    (
+      await fetch(`${base}/v1/payments/${id}`, {headers: {'x-api-key': key}})
+    ).json()
+  assert.equal(
+    (await outgoing(sent.checking_id)).status,
+    'LIGHTNING_PAYMENT_SUCCEEDED'
+  )
+  assert.equal(
+    (await outgoing(data.sendHash)).status,
+    'LIGHTNING_PAYMENT_SUCCEEDED'
+  )
+  await save({outage: true})
+  assert.equal((await outgoing(sent.checking_id)).status, 'UNKNOWN')
+  assert.equal(
+    (
+      await fetch(`${base}/v1/invoices/receive-test`, {
+        headers: {'x-api-key': key}
+      })
+    ).status,
+    500
+  )
+  await stop()
+  assert.equal(JSON.parse(await readFile(fixturePath, 'utf8')).submissions, 1)
+  for (const cwd of workingDirectories) assert.deepEqual(await readdir(cwd), [])
 }
 
 for (const optimized of [false, true]) {
-  test(`HTTP status and SSE recover receipts after restart (optimized: ${optimized})`, t =>
+  test(`HTTP status and SSE work after replacement without any local files (optimized: ${optimized})`, t =>
     testReceiptRecovery(t, optimized))
 }

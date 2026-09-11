@@ -33,7 +33,6 @@ mypy:
 .PHONY: test-payments
 test-payments:
 	node --check server.mjs
-	node payment-journal.test.mjs
 	node payments.test.mjs
 	node incoming.test.mjs
 
