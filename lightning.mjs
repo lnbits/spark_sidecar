@@ -35,6 +35,21 @@ export function decodePayment(invoice) {
   }
 }
 
+// SDK 0.9.0 LightningSendRequest contains encodedInvoice. The nested invoice
+// object belongs to LightningReceiveRequest and is absent on outgoing requests.
+export function lightningSendPaymentHash(request) {
+  const invoice = request?.encodedInvoice
+  if (typeof invoice !== 'string' || invoice.length > 4096) return null
+  try {
+    const hash = decodePayment(invoice).hash
+    return typeof hash === 'string' && /^[0-9a-f]{64}$/i.test(hash)
+      ? hash.toLowerCase()
+      : null
+  } catch {
+    return null
+  }
+}
+
 export class FundsUnavailableError extends Error {
   constructor(recoverable) {
     super('Waiting for spendable Spark funds')
@@ -189,7 +204,7 @@ export async function findLightningPayment(
         request.typename === 'LightningSendRequest' &&
         typeof request.id === 'string' &&
         request.id.length > 0 &&
-        request.invoice?.paymentHash?.toLowerCase() === paymentHash
+        lightningSendPaymentHash(request) === paymentHash
       ) {
         scan.hasMatch = true
         if (match && match.id !== request.id) {

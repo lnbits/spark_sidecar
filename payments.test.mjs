@@ -7,6 +7,7 @@ import {
   SparkWallet,
   Network
 } from '@buildonspark/spark-sdk'
+import {getLightningSendRequestQuery} from '@buildonspark/spark-sdk/types'
 import {PaymentService, createPaymentHandler} from './payments.mjs'
 import {
   decodePayment,
@@ -25,7 +26,7 @@ const request = (
   id,
   typename: 'LightningSendRequest',
   status,
-  invoice: {paymentHash},
+  encodedInvoice: invoice,
   fee: money(2),
   paymentPreimage: 'proof'
 })
@@ -223,6 +224,36 @@ test('lost send response recovers through Spark history after replacement', asyn
   assert.equal(calls, 1)
 })
 
+test('hash recovery matches outgoing invoices parsed by SDK 0.9.0', async t => {
+  const providerRequest = getLightningSendRequestQuery(
+    'spark-request'
+  ).constructObject({
+    entity: {
+      lightning_send_request_id: 'spark-request',
+      lightning_send_request_encoded_invoice: invoice.toUpperCase(),
+      lightning_send_request_status: 'LIGHTNING_PAYMENT_SUCCEEDED',
+      lightning_send_request_network: 'MAINNET',
+      lightning_send_request_fee: {
+        currency_amount_original_unit: 'SATOSHI',
+        currency_amount_original_value: 2
+      },
+      lightning_send_request_payment_preimage: 'proof'
+    }
+  })
+  assert.equal(providerRequest.invoice, undefined)
+  const {service} = setup(t, {
+    getUserRequests: async () => page([providerRequest]),
+    payLightningInvoice: async () =>
+      assert.fail('status recovery must not send')
+  })
+  const result = await service.lightning(paymentHash)
+  assert.equal(result.status, 'LIGHTNING_PAYMENT_SUCCEEDED')
+  assert.equal(result.checking_id, paymentHash)
+  assert.equal(result.payment_hash, paymentHash)
+  assert.equal(result.fee_msat, 2000)
+  assert.equal(result.preimage, 'proof')
+})
+
 test('unknown, absent and mismatched provider responses never settle or resend', async t => {
   for (const response of [
     null,
@@ -245,6 +276,24 @@ test('unknown, absent and mismatched provider responses never settle or resend',
     }
   })
   assert.equal((await service.lightning('spark-request')).status, 'UNKNOWN')
+})
+
+test('hash recovery ignores missing, malformed and unrelated outgoing invoices', async t => {
+  for (const encodedInvoice of [undefined, 'invalid invoice', invoice]) {
+    const {service} = setup(t, {
+      getUserRequests: async () => page([{...request(), encodedInvoice}]),
+      payLightningInvoice: async () =>
+        assert.fail('status recovery must not send')
+    })
+    assert.equal((await service.lightning('0'.repeat(64))).status, 'UNKNOWN')
+  }
+  const {service} = setup(t, {
+    payLightningInvoice: async () => ({
+      ...request(),
+      encodedInvoice: 'invalid invoice'
+    })
+  })
+  assert.equal((await service.lightning(paymentHash, data)).status, 'UNKNOWN')
 })
 
 test('old hash-based checking IDs never infer failure from an earlier attempt', async t => {
@@ -523,7 +572,7 @@ test('concurrent invoices and duplicate POSTs stay separate with provider dedupl
         sent.set(params.idempotencyKey, {
           ...request(),
           id: `spark-${hash}`,
-          invoice: {paymentHash: hash}
+          encodedInvoice: params.invoice
         })
       return sent.get(params.idempotencyKey)
     }

@@ -6,6 +6,7 @@ import {
   findLightningPayment,
   terminalPaymentStatuses,
   decodePayment,
+  lightningSendPaymentHash,
   FundsUnavailableError,
   PaymentPreparationError
 } from './lightning.mjs'
@@ -68,7 +69,7 @@ export class PaymentService {
   response(checkingId, result, paymentHash = null) {
     return {
       checking_id: checkingId,
-      payment_hash: paymentHash || result?.invoice?.paymentHash || null,
+      payment_hash: paymentHash || lightningSendPaymentHash(result),
       status: result?.status || 'UNKNOWN',
       fee_msat: result?.fee ? msats(result.fee) : null,
       preimage: result?.paymentPreimage || null
@@ -164,10 +165,7 @@ export class PaymentService {
           error_message: 'Spark rejected the payment before dispatch'
         }
       if (!result?.id) return this.response(checkingId)
-      if (
-        result.invoice?.paymentHash &&
-        result.invoice.paymentHash.toLowerCase() !== checkingId
-      )
+      if (lightningSendPaymentHash(result) !== checkingId)
         throw new Error('Spark payment hash mismatch')
       return this.response(result.id, result, checkingId)
     } catch {

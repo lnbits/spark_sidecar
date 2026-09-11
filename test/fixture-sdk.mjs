@@ -48,7 +48,7 @@ export const SparkWallet = {
           id: 'spark-send-request',
           typename: 'LightningSendRequest',
           status: 'CREATED',
-          invoice: {paymentHash: data.sendHash},
+          encodedInvoice: params.invoice,
           fee: {originalUnit: 'SATOSHI', originalValue: 1}
         }
         data.idempotencyKey = params.idempotencyKey
