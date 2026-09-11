@@ -2,6 +2,8 @@ import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 
+import {createOnchainHandler} from './onchain.mjs'
+
 import {SparkWallet, SparkWalletEvent} from '@buildonspark/spark-sdk'
 
 const PORT = parseInt(process.env.SPARK_SIDECAR_PORT || '8765', 10)
@@ -59,6 +61,7 @@ if (mnemonic) {
   mnemonicReadyResolve()
 }
 
+let onchainHandler = null
 let walletPromise
 let walletInstance
 const paymentHashToRequestId = new Map()
@@ -203,6 +206,7 @@ async function shutdown() {
   } catch (error) {
     console.error('Error during Spark sidecar shutdown:', error)
   } finally {
+    await onchainHandler?.close()
     process.exit(0)
   }
 }
@@ -545,6 +549,15 @@ function removeSseClient(res) {
   }
 }
 
+onchainHandler = process.env.SPARK_ONCHAIN_ENABLED === 'true'
+  ? await createOnchainHandler({
+      getWallet,
+      network: NETWORK,
+      apiKey: API_KEY,
+      directory: process.env.SPARK_ONCHAIN_STATE_DIR || path.join(path.dirname(STATE_PATH), 'onchain')
+    })
+  : null
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(
     req.url || '/',
@@ -558,6 +571,7 @@ const server = http.createServer(async (req, res) => {
 
   console.log(`${req.method} ${url.pathname}`)
   try {
+    if (onchainHandler && await onchainHandler(req, res, url)) return
     if (req.method === 'GET' && url.pathname === '/health') {
       return sendJson(res, 200, {status: 'ok'})
     }

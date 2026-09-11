@@ -129,3 +129,28 @@ Optional tuning:
 
 [![Visit LNbits Shop](https://img.shields.io/badge/Visit-LNbits%20Shop-7C3AED?logo=shopping-cart&logoColor=white&labelColor=5B21B6)](https://shop.lnbits.com/)
 [![Try myLNbits SaaS](https://img.shields.io/badge/Try-myLNbits%20SaaS-2563EB?logo=lightning&logoColor=white&labelColor=1E40AF)](https://my.lnbits.com/login)
+
+
+## Private onchain swaps
+
+Set `SPARK_ONCHAIN_ENABLED=true` to enable the authenticated onchain protocol for
+SwapSatsPrivate. `SPARK_SIDECAR_API_KEY` must contain at least 32 characters.
+Set `SPARK_ONCHAIN_STATE_DIR` to persistent private storage; it defaults to the
+`onchain` directory beside `SPARK_SIDECAR_STATE_PATH`. Keep the sidecar reachable
+only by your LNbits service. No additional dependency is required.
+
+The optional handler provides unique single-use deposit addresses, Spark deposit
+claim evidence, capped cooperative withdrawals, and durable Lightning payment
+lookup. All send intents and request IDs are persisted before responding; an
+ambiguous result is retained and never automatically resent. The existing
+Lightning API paths remain unchanged. Enable this mode before accepting swaps.
+
+Run one writer. Back up its journal with the LNbits databases. Do not delete
+operation files to retry payments. Graceful shutdown removes `writer.lock`; after
+a crash verify that the previous writer has stopped before removing a stale
+lock. Missing external request IDs require reconciliation against Spark history.
+
+Run `make test-onchain` for mock-based protocol, durability and duplicate-send
+tests. Test with the exact deployed Spark SDK and network before using real funds.
+The inspected checkout declared SDK `^0.9.0` but had `0.7.1` installed; resolve
+that mismatch explicitly as part of deployment.

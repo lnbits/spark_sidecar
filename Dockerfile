@@ -11,7 +11,7 @@ COPY package.json package-lock.json ./
 
 RUN npm ci --omit=dev && npm cache clean --force
 
-COPY server.mjs ./
+COPY server.mjs onchain.mjs ./
 
 RUN mkdir -p /data && chown -R node:node /app /data
 

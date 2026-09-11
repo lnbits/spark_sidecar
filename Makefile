@@ -29,3 +29,8 @@ checkbundle:
 
 mypy:
 	echo "Does not apply, skipping."
+
+.PHONY: test-onchain
+test-onchain:
+	node --check server.mjs
+	node onchain.test.mjs
