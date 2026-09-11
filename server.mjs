@@ -2,6 +2,10 @@ import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 
+import {createPaymentHandler} from './payments.mjs'
+import {IncomingInvoices, receiveSuccessStatuses} from './incoming.mjs'
+import {refreshBalance} from './lightning.mjs'
+
 import {SparkWallet, SparkWalletEvent} from '@buildonspark/spark-sdk'
 
 const PORT = parseInt(process.env.SPARK_SIDECAR_PORT || '8765', 10)
@@ -26,10 +30,6 @@ const INVOICE_POLL_MS = parseInt(
 )
 const INVOICE_POLL_LIMIT = parseInt(
   process.env.SPARK_INVOICE_POLL_LIMIT || '100',
-  10
-)
-const INVOICE_CACHE_TTL_MS = parseInt(
-  process.env.SPARK_INVOICE_CACHE_TTL_MS || '3600000',
   10
 )
 const TRANSFER_LOOKUP_CONCURRENCY = parseInt(
@@ -59,9 +59,12 @@ if (mnemonic) {
   mnemonicReadyResolve()
 }
 
+let server
+let paymentHandler = null
+let incomingInvoices
 let walletPromise
+let privacyPromise
 let walletInstance
-const paymentHashToRequestId = new Map()
 const sseClients = new Set()
 const sseKeepaliveTimers = new Map()
 const sseHeartbeatTimers = new Map()
@@ -71,13 +74,11 @@ let activeTransferLookups = 0
 let walletListenersAttached = false
 let droppedTransfers = 0
 let lastDropLog = 0
-const emittedInvoiceIds = new Map()
 let invoicePollTimer = null
 let invoicePollInFlight = false
-let lastSeenUpdatedAtMs = 0
+let lastSeenUpdatedAtMs = Date.now()
 let statePersistTimer = null
-let baselineInitialized = false
-let stateLoaded = false
+let invoiceScan = null
 
 const DROP_LOG_INTERVAL_MS = 10000
 
@@ -90,7 +91,6 @@ function loadState() {
     }
     const raw = fs.readFileSync(STATE_PATH, 'utf8')
     const parsed = JSON.parse(raw)
-    stateLoaded = true
     if (Number.isFinite(parsed?.lastSeenUpdatedAtMs)) {
       lastSeenUpdatedAtMs = parsed.lastSeenUpdatedAtMs
     }
@@ -133,17 +133,6 @@ function getRequestUpdatedAtMs(request) {
   return Number.isFinite(parsed) ? parsed : 0
 }
 
-function rememberInvoiceEmitted(requestId, now = Date.now()) {
-  if (!requestId) {
-    return false
-  }
-  if (emittedInvoiceIds.has(requestId)) {
-    return true
-  }
-  emittedInvoiceIds.set(requestId, now)
-  return false
-}
-
 function attachWalletListeners(wallet) {
   if (walletListenersAttached) {
     return
@@ -173,15 +162,18 @@ async function getWallet() {
         }
       }
     }).then(({wallet}) => {
-      walletInstance = wallet
       attachWalletListeners(wallet)
       console.log('Spark wallet initialized.')
       return wallet
     })
   }
   const wallet = await walletPromise
-
-  await wallet.setPrivacyEnabled(true)
+  privacyPromise ||= wallet.setPrivacyEnabled(true).catch(error => {
+    privacyPromise = null
+    throw error
+  })
+  await privacyPromise
+  walletInstance = wallet
 
   if (wallet && !walletListenersAttached) {
     attachWalletListeners(wallet)
@@ -189,8 +181,15 @@ async function getWallet() {
   return wallet
 }
 
+let stopping = false
 async function shutdown() {
+  if (stopping) return
+  stopping = true
+  server?.close()
   try {
+    stopInvoicePolling()
+    await incomingInvoices?.close()
+    await paymentHandler?.close()
     console.log('Shutting down Spark sidecar...')
     if (walletPromise) {
       const wallet = await walletPromise
@@ -261,40 +260,6 @@ function setMnemonic(nextMnemonic) {
   return {status: 'set'}
 }
 
-const SEND_SUCCESS_STATUSES = new Set([
-  'LIGHTNING_PAYMENT_SUCCEEDED',
-  'TRANSFER_COMPLETED',
-  'PREIMAGE_PROVIDED'
-])
-const SEND_FAILURE_STATUSES = new Set([
-  'LIGHTNING_PAYMENT_FAILED',
-  'TRANSFER_FAILED',
-  'PREIMAGE_PROVIDING_FAILED',
-  'USER_TRANSFER_VALIDATION_FAILED',
-  'USER_SWAP_RETURN_FAILED'
-])
-const RECEIVE_SUCCESS_STATUSES = new Set([
-  'LIGHTNING_PAYMENT_RECEIVED',
-  'TRANSFER_COMPLETED',
-  'PAYMENT_PREIMAGE_RECOVERED'
-])
-
-function isSendTerminal(status) {
-  return SEND_SUCCESS_STATUSES.has(status) || SEND_FAILURE_STATUSES.has(status)
-}
-
-async function waitForSendStatus(wallet, requestId, timeoutMs) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    const payment = await wallet.getLightningSendRequest(requestId)
-    if (payment && isSendTerminal(payment.status)) {
-      return payment
-    }
-    await new Promise(resolve => setTimeout(resolve, PAY_POLL_MS))
-  }
-  return null
-}
-
 function enqueueTransferLookup(transferId) {
   if (pendingTransferIds.has(transferId)) {
     return
@@ -333,97 +298,56 @@ function processTransferQueue() {
   }
 }
 
-function pruneEmittedInvoiceCache(now) {
-  if (INVOICE_CACHE_TTL_MS <= 0) {
-    return
-  }
-  for (const [invoiceId, timestamp] of emittedInvoiceIds) {
-    if (now - timestamp > INVOICE_CACHE_TTL_MS) {
-      emittedInvoiceIds.delete(invoiceId)
-    }
-  }
-}
-
 async function pollInvoiceUpdates() {
-  if (invoicePollInFlight || sseClients.size === 0) {
-    return
-  }
+  if (invoicePollInFlight || sseClients.size === 0 || stopping) return
   invoicePollInFlight = true
   try {
-    const now = Date.now()
-    pruneEmittedInvoiceCache(now)
+    await incomingInvoices.retryPending(INVOICE_POLL_LIMIT)
     const wallet = walletInstance || (await getWallet())
-    let maxSeenUpdatedAtMs = lastSeenUpdatedAtMs
-    let hasEntity = false
-    let cursor = undefined
-    let reachedKnown = false
-    let isFirstPage = true
-    while (true) {
+    invoiceScan ||= {
+      cursor: undefined,
+      maxSeen: lastSeenUpdatedAtMs,
+      threshold: lastSeenUpdatedAtMs
+    }
+    // Bound each pass; retain the cursor to catch up across ticks under load.
+    for (let page = 0; page < 4; page++) {
       const response = await wallet.getUserRequests({
         first: INVOICE_POLL_LIMIT,
-        after: cursor,
+        after: invoiceScan.cursor,
         types: ['LIGHTNING_RECEIVE'],
         statuses: ['SUCCEEDED']
       })
       const entities = response?.entities || []
-      console.log(
-        `Polled ${entities.length} lightning receive requests (cursor: ${cursor})`
-      )
+      let reachedKnown = false
+      const observations = []
       for (const request of entities) {
-        if (!request || request.typename !== 'LightningReceiveRequest') {
+        if (
+          request?.typename !== 'LightningReceiveRequest' ||
+          !receiveSuccessStatuses.has(request.status)
+        )
           continue
-        }
-        if (!RECEIVE_SUCCESS_STATUSES.has(request.status)) {
-          continue
-        }
-        const updatedAtMs = getRequestUpdatedAtMs(request)
-        hasEntity = true
-        if (updatedAtMs > maxSeenUpdatedAtMs) {
-          maxSeenUpdatedAtMs = updatedAtMs
-        }
-        if (!baselineInitialized && !stateLoaded && lastSeenUpdatedAtMs === 0) {
-          continue
-        }
-        if (updatedAtMs && updatedAtMs <= lastSeenUpdatedAtMs) {
+        const stamp = getRequestUpdatedAtMs(request)
+        if (stamp && stamp < invoiceScan.threshold) {
           reachedKnown = true
           continue
         }
-        if (rememberInvoiceEmitted(request.id, now)) {
-          continue
-        }
-        const invoice = request.invoice || {}
-        sendSseEvent({
-          checking_id: request.id,
-          payment_hash: invoice.paymentHash || null,
-          status: request.status
-        })
+        invoiceScan.maxSeen = Math.max(invoiceScan.maxSeen, stamp)
+        observations.push(incomingInvoices.observe(request))
       }
-
-      if (
-        isFirstPage &&
-        !baselineInitialized &&
-        !stateLoaded &&
-        lastSeenUpdatedAtMs === 0
-      ) {
-        baselineInitialized = true
-        if (hasEntity && maxSeenUpdatedAtMs > lastSeenUpdatedAtMs) {
-          lastSeenUpdatedAtMs = maxSeenUpdatedAtMs
-          scheduleStatePersist()
-        }
-        return
-      }
-
-      const pageInfo = response?.pageInfo || {}
-      cursor = pageInfo.endCursor
-      if (!pageInfo.hasNextPage || !cursor || reachedKnown) {
+      // Every candidate is durable before advancing the discovery watermark.
+      const results = await Promise.allSettled(observations)
+      const failed = results.find(result => result.status === 'rejected')
+      if (failed) throw failed.reason
+      const info = response?.pageInfo || {}
+      if (!info.hasNextPage || reachedKnown) {
+        lastSeenUpdatedAtMs = invoiceScan.maxSeen
+        invoiceScan = null
+        scheduleStatePersist()
         break
       }
-      isFirstPage = false
-    }
-
-    if (maxSeenUpdatedAtMs > lastSeenUpdatedAtMs) {
-      lastSeenUpdatedAtMs = maxSeenUpdatedAtMs
-      scheduleStatePersist()
+      if (!info.endCursor || info.endCursor === invoiceScan.cursor)
+        throw new Error('Invalid invoice pagination')
+      invoiceScan.cursor = info.endCursor
     }
   } catch (error) {
     console.error('Error polling lightning invoices:', error)
@@ -448,41 +372,28 @@ async function handleTransferLookup(transferId) {
     if (!userRequest || userRequest.typename !== 'LightningReceiveRequest') {
       return
     }
-    if (!RECEIVE_SUCCESS_STATUSES.has(userRequest.status)) {
-      return
-    }
-    const updatedAtMs = getRequestUpdatedAtMs(userRequest)
-    if (updatedAtMs && updatedAtMs <= lastSeenUpdatedAtMs) {
-      return
-    }
-    if (rememberInvoiceEmitted(userRequest.id)) {
-      return
-    }
-    const invoice = userRequest.invoice || {}
-    sendSseEvent({
-      checking_id: userRequest.id,
-      payment_hash: invoice.paymentHash || null,
-      status: userRequest.status
-    })
-    if (updatedAtMs > lastSeenUpdatedAtMs) {
-      lastSeenUpdatedAtMs = updatedAtMs
-      scheduleStatePersist()
-    }
+    if (!receiveSuccessStatuses.has(userRequest.status)) return
+    await incomingInvoices.observe(userRequest)
   } catch (error) {
     console.error('Error handling transfer event:', error)
   }
 }
 
 function sendSseEvent(payload) {
-  console.log('Sending SSE event')
+  if (sseClients.size === 0) return false
+  let sent = false
   const data = `data: ${JSON.stringify(payload)}\n\n`
   for (const res of sseClients) {
     try {
-      res.write(data)
+      if (!res.write(data)) {
+        res.destroy()
+        removeSseClient(res)
+      } else sent = true
     } catch (error) {
       removeSseClient(res)
     }
   }
+  return sent
 }
 
 function addSseClient(res) {
@@ -494,6 +405,13 @@ function addSseClient(res) {
   })
   res.write(':\n\n')
   sseClients.add(res)
+  if (!invoicePollTimer) {
+    invoicePollTimer = setInterval(
+      () => void pollInvoiceUpdates(),
+      Math.max(1, INVOICE_POLL_MS)
+    )
+    void pollInvoiceUpdates()
+  }
 
   if (STREAM_KEEPALIVE_MS > 0) {
     const timer = setInterval(() => {
@@ -545,7 +463,35 @@ function removeSseClient(res) {
   }
 }
 
-const server = http.createServer(async (req, res) => {
+paymentHandler = await createPaymentHandler({
+  getWallet,
+  network: NETWORK,
+  apiKey: API_KEY,
+  waitMs: PAY_WAIT_MS,
+  pollMs: PAY_POLL_MS,
+  concurrency: Number(process.env.SPARK_OPERATION_CONCURRENCY || 8),
+  fundsWaitMs: Math.max(
+    0,
+    parseInt(process.env.SPARK_FUNDS_WAIT_MS || '20000', 10)
+  ),
+  directory:
+    process.env.SPARK_PAYMENT_STATE_DIR ||
+    // Reuse journals from the earlier combined build; never lose send intents.
+    process.env.SPARK_ONCHAIN_STATE_DIR ||
+    (fs.existsSync(path.join(path.dirname(STATE_PATH), 'onchain'))
+      ? path.join(path.dirname(STATE_PATH), 'onchain')
+      : path.join(path.dirname(STATE_PATH), 'payments'))
+})
+
+incomingInvoices = new IncomingInvoices({
+  journal: paymentHandler.journal,
+  getWallet,
+  emit: sendSseEvent,
+  concurrency: Number(process.env.SPARK_OPERATION_CONCURRENCY || 8)
+})
+await incomingInvoices.initialize()
+
+server = http.createServer(async (req, res) => {
   const url = new URL(
     req.url || '/',
     `http://${req.headers.host || 'localhost'}`
@@ -558,6 +504,7 @@ const server = http.createServer(async (req, res) => {
 
   console.log(`${req.method} ${url.pathname}`)
   try {
+    if (paymentHandler && (await paymentHandler(req, res, url))) return
     if (req.method === 'GET' && url.pathname === '/health') {
       return sendJson(res, 200, {status: 'ok'})
     }
@@ -586,7 +533,7 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, {status: 'missing_mnemonic'})
       }
       const wallet = await getWallet()
-      const balance = await wallet.getBalance()
+      const balance = await refreshBalance(wallet)
       const sats = BigInt(balance.balance)
       return sendJson(res, 200, {
         balance_sats: sats.toString(),
@@ -617,67 +564,9 @@ const server = http.createServer(async (req, res) => {
       })
     }
 
-    if (req.method === 'POST' && url.pathname === '/v1/payments') {
-      const wallet = await getWallet()
-      const body = await readJson(req)
-      const bolt11 = body.bolt11
-      if (!bolt11) {
-        return sendJson(res, 400, {error: 'Missing bolt11'})
-      }
-      const maxFeeSats = Number(body.max_fee_sats || 0)
-      const amountSatsToSend = body.amount_sats
-        ? Number(body.amount_sats)
-        : undefined
-      const paymentHash = body.payment_hash || null
-      try {
-        let payment = await wallet.payLightningInvoice({
-          invoice: bolt11,
-          maxFeeSats,
-          amountSatsToSend
-        })
-        if (
-          PAY_WAIT_MS > 0 &&
-          payment &&
-          payment.id &&
-          !isSendTerminal(payment.status)
-        ) {
-          const refreshed = await waitForSendStatus(
-            wallet,
-            payment.id,
-            PAY_WAIT_MS
-          )
-          if (refreshed) {
-            payment = refreshed
-          }
-        }
-        if (paymentHash && payment?.id) {
-          paymentHashToRequestId.set(paymentHash, payment.id)
-        }
-        return sendJson(res, 200, {
-          checking_id: paymentHash || payment.id,
-          payment_hash: paymentHash,
-          status: payment.status,
-          fee_msat: feeToMsat(payment.fee),
-          preimage: payment.paymentPreimage || null
-        })
-      } catch (error) {
-        console.error('Error processing payment:', error)
-        const message =
-          error && typeof error === 'object' && 'initialMessage' in error
-            ? error.initialMessage
-            : error instanceof Error
-              ? error.message
-              : String(error)
-        message == '' && (message = 'Payment failed')
-
-        return sendJson(res, 500, {error: message})
-      }
-    }
-
     const parts = url.pathname.split('/').filter(Boolean)
     if (parts.length === 3 && parts[0] === 'v1' && parts[1] === 'invoices') {
-      const wallet = await getWallet()
-      const invoice = await wallet.getLightningReceiveRequest(parts[2])
+      const invoice = await incomingInvoices.observe({id: parts[2]})
       if (!invoice) {
         return sendJson(res, 404, {error: 'Not found'})
       }
@@ -692,18 +581,8 @@ const server = http.createServer(async (req, res) => {
     if (parts.length === 3 && parts[0] === 'v1' && parts[1] === 'payments') {
       const wallet = await getWallet()
       const requestedId = parts[2]
-      const lookupId = paymentHashToRequestId.get(requestedId)
-
-      if (!lookupId && /^[0-9a-fA-F]{64}$/.test(requestedId)) {
-        return sendJson(res, 404, {
-          error: 'Payment hash not mapped to Spark payment request ID',
-          checking_id: requestedId
-        })
-      }
-
-      const payment = await wallet.getLightningSendRequest(
-        lookupId || requestedId
-      )
+      // Legacy clients may still use an opaque Spark request ID.
+      const payment = await wallet.getLightningSendRequest(requestedId)
       if (!payment) {
         return sendJson(res, 404, {error: 'Not found'})
       }
