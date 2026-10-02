@@ -51,7 +51,7 @@ export const SparkWallet = {
           encodedInvoice: params.invoice,
           fee: {originalUnit: 'SATOSHI', originalValue: 1}
         }
-        data.idempotencyKey = params.idempotencyKey
+        data.transferId = params.transferId.toString()
         data.submissions = (data.submissions || 0) + 1
         // This file represents the external Spark service in the test. It is
         // outside the sidecar working directory and is never a sidecar journal.

@@ -211,7 +211,7 @@ test('missing cache entries and unrelated balance alone do not prove clearing', 
   assert.equal(await receivedFundsAvailable(wallet, invoice), false)
 })
 
-test('SDK 0.9.0 getTransfer preserves receiver legs and blocks multi-receiver ownership inference', async () => {
+test('SDK 0.13.0 getTransfer preserves receiver legs and blocks multi-receiver ownership inference', async () => {
   const ownKey = Buffer.from(`02${'1'.repeat(64)}`, 'hex')
   const otherKey = Buffer.from(`03${'2'.repeat(64)}`, 'hex')
   const laterOwner = Buffer.from(`02${'3'.repeat(64)}`, 'hex')
@@ -253,6 +253,7 @@ test('SDK 0.9.0 getTransfer preserves receiver legs and blocks multi-receiver ow
   const single = await wallet.getTransfer('transfer')
   assert.deepEqual(single.receivers, [
     {
+      id: 'own',
       identityPublicKey: ownKey.toString('hex'),
       amountSats: 100,
       status: 'TRANSFER_RECEIVER_STATUS_COMPLETED'
