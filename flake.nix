@@ -16,7 +16,7 @@
         package = pkgs.buildNpmPackage {
           inherit pname version;
           src = ./.;
-          npmDepsHash = "sha256-6TdR6dCmC2Oe/B520L4PNy/Y0KChJEDZa0rPo4HHvx4=";
+          npmDepsHash = "sha256-LQ9rqHf/Gd7Cu5iME+wXdz7IOKFwKFlMBOaQq9ZOI1g=";
 
           dontNpmBuild = true;
           dontBuild = true;

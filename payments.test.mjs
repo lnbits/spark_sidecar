@@ -5,7 +5,8 @@ import {bech32} from '@scure/base'
 import {
   SparkValidationError,
   SparkWallet,
-  Network
+  Network,
+  UUID
 } from '@buildonspark/spark-sdk'
 import {getLightningSendRequestQuery} from '@buildonspark/spark-sdk/types'
 import {PaymentService, createPaymentHandler} from './payments.mjs'
@@ -104,7 +105,7 @@ test('the pinned SDK passes the sidecar idempotency key to its preimage-swap ser
       feeEstimate: {originalUnit: 'SATOSHI', originalValue: 1}
     }),
     requestLightningSend: async ({userOutboundTransferExternalId}) => {
-      assert.equal(userOutboundTransferExternalId, 'provider-transfer')
+      assert.equal(userOutboundTransferExternalId, keys.at(-1))
       return request()
     }
   })
@@ -114,11 +115,19 @@ test('the pinned SDK passes the sidecar idempotency key to its preimage-swap ser
     selectLeavesAndExecute: async (_, callback) => callback([[]]),
     handleTransferEvent: async () => {}
   }
-  sdk.transferService = {prepareTransferForLightning: async () => ({})}
+  sdk.transferService = {
+    prepareTransferForLightning: async (_, __, ___, transferId) => ({
+      transferId
+    })
+  }
   sdk.lightningService = {
     swapNodesForPreimage: async params => {
+      assert.equal(
+        params.startTransferRequest.transferId,
+        params.idempotencyKey
+      )
       keys.push(params.idempotencyKey)
-      return {transfer: {id: 'provider-transfer'}}
+      return {transfer: {id: keys.at(-1), leaves: []}}
     }
   }
   const options = {
@@ -135,7 +144,10 @@ test('the pinned SDK passes the sidecar idempotency key to its preimage-swap ser
     )
   }
   assert.equal(keys.length, 2)
-  assert.match(keys[0], /^[0-9a-f]{64}$/)
+  assert.match(
+    keys[0],
+    /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+  )
   assert.equal(keys[0], keys[1])
 })
 
@@ -176,9 +188,14 @@ test('Spark receives a stable idempotency key across restarts, casing and fee ch
     // Simulate provider history lag: deduplication must not depend on local data.
     payLightningInvoice: async params => {
       assert.equal(params.preferSpark, false)
-      assert.match(params.idempotencyKey, /^[0-9a-f]{64}$/)
-      if (!keys.has(params.idempotencyKey)) {
-        keys.add(params.idempotencyKey)
+      assert.ok(params.transferId instanceof UUID)
+      assert.equal(params.idempotencyKey, undefined)
+      assert.match(
+        params.transferId.toString(),
+        /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      )
+      if (!keys.has(params.transferId.toString())) {
+        keys.add(params.transferId.toString())
         transfers++
       }
       return request()
@@ -225,7 +242,7 @@ test('lost send response recovers through Spark history after replacement', asyn
   assert.equal(calls, 1)
 })
 
-test('hash recovery matches outgoing invoices parsed by SDK 0.9.0', async t => {
+test('hash recovery matches outgoing invoices parsed by SDK 0.13.0', async t => {
   const providerRequest = getLightningSendRequestQuery(
     'spark-request'
   ).constructObject({
@@ -623,13 +640,13 @@ test('concurrent invoices and duplicate POSTs stay separate with provider dedupl
       peak = Math.max(peak, activeHashes.size)
       await new Promise(resolve => setTimeout(resolve, 5))
       activeHashes.delete(hash)
-      if (!sent.has(params.idempotencyKey))
-        sent.set(params.idempotencyKey, {
+      if (!sent.has(params.transferId.toString()))
+        sent.set(params.transferId.toString(), {
           ...request(),
           id: `spark-${hash}`,
           encodedInvoice: params.invoice
         })
-      return sent.get(params.idempotencyKey)
+      return sent.get(params.transferId.toString())
     }
   })
   const handler = await createPaymentHandler({...options, apiKey: 'test'})

@@ -13,7 +13,7 @@ export const terminalPaymentStatuses = new Set([
   'USER_SWAP_RETURN_FAILED'
 ])
 
-// These validations occur before payment dispatch in SDK 0.9.0. Do not
+// These validations occur before payment dispatch in SDK 0.13.0. Do not
 // classify all SparkValidationErrors as failed: some occur after sending.
 function rejectedBeforeSend(error) {
   if (!(error instanceof SparkValidationError)) return false
@@ -35,7 +35,7 @@ export function decodePayment(invoice) {
   }
 }
 
-// SDK 0.9.0 LightningSendRequest contains encodedInvoice. The nested invoice
+// SDK 0.13.0 LightningSendRequest contains encodedInvoice. The nested invoice
 // object belongs to LightningReceiveRequest and is absent on outgoing requests.
 export function lightningSendPaymentHash(request) {
   const invoice = request?.encodedInvoice
@@ -140,7 +140,7 @@ export async function prepareLightningPayment(
   let fee
   try {
     fee = await wallet.getLightningSendFeeEstimate({
-      // SDK 0.9.0 payLightningInvoice normalizes before requesting its quote.
+      // SDK 0.13.0 payLightningInvoice normalizes before requesting its quote.
       // The standalone quote method does not; preserve that behavior here too.
       encodedInvoice: params.invoice.toLowerCase(),
       amountSats: params.amountSatsToSend
