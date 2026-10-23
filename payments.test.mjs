@@ -11,6 +11,7 @@ import {getLightningSendRequestQuery} from '@buildonspark/spark-sdk/types'
 import {PaymentService, createPaymentHandler} from './payments.mjs'
 import {
   decodePayment,
+  findLightningPayment,
   prepareLightningPayment,
   sendLightningPayment
 } from './lightning.mjs'
@@ -326,24 +327,78 @@ test('submissions do not restart failed or ambiguous legacy attempts', async t =
   }
 })
 
-test('long history scans are bounded per check and continue until the payment is found', async t => {
+test('one lookup scans every history page, including short and empty pages', async t => {
+  for (const matchPage of [0, 3, -1]) {
+    const afters = []
+    const cursors = [undefined, 'a', 'b', 'c']
+    const {service} = setup(t, {
+      getUserRequests: async ({first, after, types}) => {
+        assert.equal(first, 100)
+        assert.deepEqual(types, ['LIGHTNING_SEND'])
+        afters.push(after)
+        const index = cursors.indexOf(after)
+        assert.notEqual(index, -1)
+        return page(index === matchPage ? [request()] : [], cursors[index + 1])
+      }
+    })
+    assert.equal(
+      (await service.lightning(paymentHash)).status,
+      matchPage === -1 ? 'UNKNOWN' : 'LIGHTNING_PAYMENT_SUCCEEDED'
+    )
+    assert.deepEqual(afters, cursors)
+  }
+})
+
+test('submissions recover an existing payment beyond page two before dispatch', async t => {
   const afters = []
   const {service} = setup(t, {
     getUserRequests: async ({after}) => {
       afters.push(after)
       if (!after) return page([], 'a')
       if (after === 'a') return page([], 'b')
-      if (after === 'b') return page([], 'c')
       return page([request()])
-    }
+    },
+    getBalance: async () => assert.fail('must recover before checking funds'),
+    payLightningInvoice: async () => assert.fail('must not resubmit')
   })
-  assert.equal((await service.lightning(paymentHash)).status, 'UNKNOWN')
-  assert.equal(afters.length, 2)
-  assert.equal(
-    (await service.lightning(paymentHash)).status,
-    'LIGHTNING_PAYMENT_SUCCEEDED'
-  )
-  assert.deepEqual(afters, [undefined, 'a', 'b', 'c'])
+  const result = await service.lightning(paymentHash, data)
+  assert.equal(result.status, 'LIGHTNING_PAYMENT_SUCCEEDED')
+  assert.equal(result.checking_id, 'spark-request')
+  assert.deepEqual(afters, [undefined, 'a', 'b'])
+})
+
+test('a second matching attempt on a later page remains ambiguous', async t => {
+  const afters = []
+  const {service} = setup(t, {
+    getUserRequests: async ({after}) => {
+      afters.push(after)
+      if (!after) return page([request()], 'a')
+      if (after === 'a') return page([], 'b')
+      return page([request('CREATED', 'second')])
+    },
+    payLightningInvoice: async () => assert.fail('must not resubmit')
+  })
+  assert.equal((await service.lightning(paymentHash, data)).status, 'UNKNOWN')
+  assert.deepEqual(afters, [undefined, 'a', 'b'])
+})
+
+test('history pagination rejects missing, invalid and cyclic cursors', async () => {
+  for (const endCursor of [undefined, null, '', 123, {}, 'repeat']) {
+    let calls = 0
+    const wallet = {
+      getUserRequests: async () => {
+        assert(++calls <= 2, 'must stop before requesting a repeated page')
+        return {
+          entities: [request()],
+          pageInfo: {hasNextPage: true, endCursor}
+        }
+      }
+    }
+    await assert.rejects(findLightningPayment(wallet, paymentHash), {
+      message: 'Invalid Spark pagination'
+    })
+    assert.equal(calls, endCursor === 'repeat' ? 2 : 1)
+  }
 })
 
 test('malformed history never proves success', async t => {

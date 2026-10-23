@@ -149,8 +149,9 @@ Optional tuning:
 outgoing operation workflows. Incoming receipt checks have a separate pool of
 the same size. Different operation IDs run concurrently; duplicate requests for
 one ID serialize and cannot dispatch it twice. Concurrent balance refreshes share
-one SDK call. Long outgoing history scans continue across polls, at most two pages
-per lookup. Incoming discovery reads at most four pages per polling pass. Slow
+one SDK call. Outgoing hash lookups follow Spark's history cursors through all
+pages in one lookup, so long histories can take longer to check. Incoming
+discovery reads at most four pages per polling pass. Slow
 stream clients are disconnected when their write buffers fill.
 
 Outgoing payments check spendable funds including quoted fees before dispatch.

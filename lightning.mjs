@@ -180,15 +180,12 @@ export async function sendLightningPayment(wallet, params) {
   }
 }
 
-export async function findLightningPayment(
-  wallet,
-  paymentHash,
-  scan = {},
-  maxPages = Infinity
-) {
+export async function findLightningPayment(wallet, paymentHash, scan = {}) {
   let {after, match} = scan
   const cursors = (scan.cursors ||= new Set())
-  for (let pageNumber = 0; pageNumber < maxPages; pageNumber++) {
+  // Follow Spark's cursors to exhaustion, including short or empty pages.
+  // A partial scan cannot establish whether an invoice has another attempt.
+  for (;;) {
     const page = await wallet.getUserRequests({
       first: 100,
       after,
@@ -231,10 +228,9 @@ export async function findLightningPayment(
         : null
     }
     after = page.pageInfo.endCursor
-    if (!after || cursors.has(after))
+    if (typeof after !== 'string' || !after || cursors.has(after))
       throw new Error('Invalid Spark pagination')
     cursors.add(after)
     Object.assign(scan, {after, match})
   }
-  return null
 }

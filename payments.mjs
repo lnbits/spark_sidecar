@@ -58,7 +58,7 @@ export class PaymentService {
     this.network = network
     this.fundsWaitMs = fundsWaitMs
     this.operations = new OperationQueue(concurrency)
-    // Disposable pagination cursors only; losing these just restarts a lookup.
+    // Disposable lookup state only; losing this just restarts a lookup.
     this.historyScans = new Map()
   }
 
@@ -123,7 +123,12 @@ export class PaymentService {
       // unresolved match, do not interpret it as permission to start a new one.
       if (this.historyScans.get(checkingId)?.hasMatch)
         return this.response(checkingId, null, checkingId)
-    } catch {
+    } catch (error) {
+      console.log(
+        'Error while checking existing payment for',
+        checkingId,
+        error
+      )
       // This read is advisory. Submission still uses Spark's idempotency key.
     }
     try {
@@ -184,7 +189,7 @@ export class PaymentService {
     if (this.historyScans.size > 1024)
       this.historyScans.delete(this.historyScans.keys().next().value)
     try {
-      const result = await findLightningPayment(wallet, paymentHash, scan, 2)
+      const result = await findLightningPayment(wallet, paymentHash, scan)
       if (scan.complete) scan.retryAt = Date.now() + 1000
       // Do not cache a completed scan's result as authoritative payment state.
       if (result) this.historyScans.delete(paymentHash)
