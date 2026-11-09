@@ -7,7 +7,17 @@ on:
 
 jobs:
   lint:
-    uses: lnbits/lnbits/.github/workflows/lint.yml@dev
+    strategy:
+      matrix:
+        command: [checkblack, checkruff, mypy, pyright, checkprettier]
+    uses: lnbits/lnbits/.github/workflows/make.yml@dev
+    with:
+      make: ${{ matrix.command }}
+      python-version: '3.12'
+      npm: ${{ matrix.command == 'pyright' || matrix.command == 'checkprettier' }}
+
+  poetry:
+    uses: lnbits/lnbits/.github/workflows/poetry.yml@dev
 
   payments:
     strategy:
